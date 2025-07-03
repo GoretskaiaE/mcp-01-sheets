@@ -48,6 +48,13 @@ const accessTokens = new Map<string, {
 
 const sessionAuthHeaders = new Map<string, string>();
 
+const clientGoogleTokens = new Map<string, {
+  access_token: string;
+  refresh_token?: string;
+  expiry_date: number;
+  scope: string[];
+}>();
+
 // Initialize services
 const tokenManager = new TokenManager();
 const sheetsService = new GoogleSheetsService(tokenManager);
@@ -157,6 +164,29 @@ function validateBearerTokenBySession(sessionId: string | undefined): { valid: b
 // Updated MCP tools using session-based authentication
 // Replace your existing tool registrations with these:
 
+// Helper function to get Google Sheets service for a client
+async function getGoogleSheetsForClient(clientId: string): Promise<any> {
+  const googleTokens = clientGoogleTokens.get(clientId);
+  if (!googleTokens) {
+    throw new Error('No Google tokens found for this client. Please complete OAuth flow.');
+  }
+
+  // Check if Google tokens are expired
+  if (googleTokens.expiry_date <= Date.now()) {
+    throw new Error('Google tokens have expired. Please re-authenticate.');
+  }
+
+  // Create a temporary user ID for the sheets service
+  const tempUserId = `client_${clientId}`;
+  
+  // Store tokens temporarily so GoogleSheetsService can use them
+  await tokenManager.storeTokens(tempUserId, googleTokens);
+  
+  // Create GoogleSheetsService instance - it will use tokenManager to get tokens
+  return { tempUserId, sheetsService };
+}
+
+// Updated MCP tools with real Google Sheets API calls
 mcpServer.registerTool(
   "create-spreadsheet",
   {
@@ -168,7 +198,6 @@ mcpServer.registerTool(
   async ({ title }, extra) => {
     console.log('=== Create Spreadsheet Tool Called ===');
     console.log('Session ID:', extra.sessionId);
-    console.log('Available session auth headers:', Array.from(sessionAuthHeaders.keys()));
     
     const tokenValidation = validateBearerTokenBySession(extra.sessionId);
     if (!tokenValidation.valid) {
@@ -176,22 +205,24 @@ mcpServer.registerTool(
       throw new Error('Authentication required. Please complete OAuth flow first.');
     }
 
-    const userId = tokenValidation.userId!;
-    console.log('Authenticated user:', userId);
+    const clientId = tokenValidation.clientId!;
+    console.log('Authenticated client:', clientId);
     
     try {
-      // For now, we'll return a success message since we don't have real Google tokens stored
-      // In a full implementation, you'd use the stored Google tokens here
-      console.log('Creating spreadsheet with title:', title);
+      console.log('Creating real spreadsheet with title:', title);
       
-      // Mock response for now - replace with real Google Sheets API call
-      const mockId = crypto.randomBytes(16).toString('hex');
-      const mockUrl = `https://docs.google.com/spreadsheets/d/${mockId}`;
+      // Get Google Sheets service for this client
+      const { tempUserId } = await getGoogleSheetsForClient(clientId);
+      
+      // Create real spreadsheet using GoogleSheetsService
+      const result = await sheetsService.createSpreadsheet(tempUserId, title);
+      
+      console.log('Spreadsheet created successfully:', result);
       
       return {
         content: [{
           type: "text",
-          text: `✅ Spreadsheet created successfully!\n\nTitle: ${title}\nID: ${mockId}\nURL: ${mockUrl}\n\n(Note: This is a mock response. To create real spreadsheets, you need to complete the full Google OAuth integration.)`
+          text: `✅ Spreadsheet created successfully!\n\nTitle: ${title}\nID: ${result.id}\nURL: ${result.url}`
         }]
       };
       
@@ -220,21 +251,32 @@ mcpServer.registerTool(
       throw new Error('Authentication required. Please complete OAuth flow first.');
     }
 
-    const userId = tokenValidation.userId!;
-    console.log('Authenticated user:', userId);
+    const clientId = tokenValidation.clientId!;
+    console.log('Authenticated client:', clientId);
     
     try {
-      // Mock response for now
-      const mockData = [
-        ['Name', 'Age', 'City'],
-        ['John Doe', '30', 'New York'],
-        ['Jane Smith', '25', 'Los Angeles']
-      ];
+      console.log('Reading real data from spreadsheet:', spreadsheetId, 'range:', range);
+      
+      // Get Google Sheets service for this client
+      const { tempUserId } = await getGoogleSheetsForClient(clientId);
+      
+      // Read real data using GoogleSheetsService
+      const data = await sheetsService.readData(tempUserId, spreadsheetId, range);
+      
+      console.log('Data read successfully, rows:', data.length);
+      
+      // Format the data nicely
+      let formattedData = '';
+      if (data.length === 0) {
+        formattedData = 'No data found in the specified range.';
+      } else {
+        formattedData = data.map(row => row.join('\t')).join('\n');
+      }
       
       return {
         content: [{
           type: "text",
-          text: `✅ Data read from ${spreadsheetId} range ${range}:\n\n${JSON.stringify(mockData, null, 2)}\n\n(Note: This is mock data. To read real spreadsheet data, you need to complete the full Google OAuth integration.)`
+          text: `✅ Data read from ${spreadsheetId} range ${range}:\n\n${formattedData}\n\nRows returned: ${data.length}`
         }]
       };
       
@@ -264,17 +306,25 @@ mcpServer.registerTool(
       throw new Error('Authentication required. Please complete OAuth flow first.');
     }
 
-    const userId = tokenValidation.userId!;
-    console.log('Authenticated user:', userId);
+    const clientId = tokenValidation.clientId!;
+    console.log('Authenticated client:', clientId);
     
     try {
-      // Mock response for now
-      const cellCount = values.reduce((total, row) => total + row.length, 0);
+      console.log('Writing real data to spreadsheet:', spreadsheetId, 'range:', range);
+      console.log('Data to write:', JSON.stringify(values, null, 2));
+      
+      // Get Google Sheets service for this client
+      const { tempUserId } = await getGoogleSheetsForClient(clientId);
+      
+      // Write real data using GoogleSheetsService
+      const updatedCells = await sheetsService.writeData(tempUserId, spreadsheetId, range, values);
+      
+      console.log('Data written successfully, cells updated:', updatedCells);
       
       return {
         content: [{
           type: "text",
-          text: `✅ Successfully wrote data to ${spreadsheetId} range ${range}.\n\nData written:\n${JSON.stringify(values, null, 2)}\n\nMock result: Updated ${cellCount} cells.\n\n(Note: This is a mock response. To write real spreadsheet data, you need to complete the full Google OAuth integration.)`
+          text: `✅ Successfully wrote data to ${spreadsheetId} range ${range}.\n\nCells updated: ${updatedCells}\n\nData written:\n${values.map(row => row.join('\t')).join('\n')}`
         }]
       };
       
@@ -394,6 +444,34 @@ const oauthCallbackHandler = async (req: any, res: any) => {
         return res.status(400).json({ error: 'Missing authorization code' });
       }
       
+      // Exchange Google authorization code for tokens
+      console.log('Exchanging Google code for tokens...');
+      try {
+        // Create a temporary user ID for this OAuth flow
+        const tempUserId = `temp_${clientId}_${Date.now()}`;
+        
+        // Use your existing GoogleSheetsService to handle the OAuth callback
+        await sheetsService.handleOAuthCallback(tempUserId, code as string);
+        console.log('Successfully exchanged Google code for tokens');
+        
+        // Get the tokens that were just stored
+        const googleTokens = await tokenManager.getTokens(tempUserId);
+        if (googleTokens) {
+          // Store the Google tokens associated with this OAuth client
+          clientGoogleTokens.set(clientId, googleTokens);
+          console.log('Stored Google tokens for client:', clientId);
+        } else {
+          console.error('Failed to retrieve Google tokens after exchange');
+        }
+        
+        // Clean up the temporary user tokens
+        // (In production, you might want to clean this up differently)
+        
+      } catch (error) {
+        console.error('Failed to exchange Google code:', error);
+        return res.status(500).json({ error: 'Failed to exchange authorization code' });
+      }
+      
       // Generate authorization code for the MCP client
       const authCode = crypto.randomBytes(32).toString('hex');
       
@@ -407,7 +485,6 @@ const oauthCallbackHandler = async (req: any, res: any) => {
       });
       
       console.log('Stored auth code:', authCode);
-      console.log('Auth code details:', JSON.stringify(authCodes.get(authCode), null, 2));
       
       // Clean up session
       delete req.session.oauthState;

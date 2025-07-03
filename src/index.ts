@@ -46,6 +46,8 @@ const accessTokens = new Map<string, {
   created_at: number;
 }>();
 
+const sessionAuthHeaders = new Map<string, string>();
+
 // Initialize services
 const tokenManager = new TokenManager();
 const sheetsService = new GoogleSheetsService(tokenManager);
@@ -112,7 +114,49 @@ const mcpServer = new McpServer({
   version: "1.0.0"
 });
 
-// Register MCP tools - FIXED: Removed 'name' property from options
+
+// Add this helper function to validate Bearer tokens (add after your storage maps)
+function validateBearerTokenBySession(sessionId: string | undefined): { valid: boolean; clientId?: string; userId?: string } {
+  if (!sessionId) {
+    console.log('No session ID provided');
+    return { valid: false };
+  }
+
+  const authHeader = sessionAuthHeaders.get(sessionId);
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    console.log('Missing or invalid Authorization header for session:', sessionId);
+    return { valid: false };
+  }
+
+  const token = authHeader.substring(7); // Remove "Bearer " prefix
+  console.log('Validating token for session:', sessionId, 'token:', token);
+  
+  const tokenData = accessTokens.get(token);
+  if (!tokenData) {
+    console.log('Token not found in storage');
+    console.log('Available tokens:', Array.from(accessTokens.keys()));
+    return { valid: false };
+  }
+
+  // Check if token has expired
+  if (tokenData.expires_at < Date.now()) {
+    console.log('Token has expired');
+    accessTokens.delete(token); // Clean up expired token
+    sessionAuthHeaders.delete(sessionId); // Clean up session auth
+    return { valid: false };
+  }
+
+  console.log('Token validated successfully for client:', tokenData.client_id);
+  return { 
+    valid: true, 
+    clientId: tokenData.client_id,
+    userId: `oauth_${tokenData.client_id}` // Generate a consistent user ID
+  };
+}
+
+// Updated MCP tools using session-based authentication
+// Replace your existing tool registrations with these:
+
 mcpServer.registerTool(
   "create-spreadsheet",
   {
@@ -122,29 +166,39 @@ mcpServer.registerTool(
     }
   },
   async ({ title }, extra) => {
-    // Get userId from sessionId mapping or use test user
-    const userId = extra.sessionId ? userSessions[extra.sessionId] : 'test-user';
-    if (!userId) {
-      throw new Error('Authentication required');
-    }
+    console.log('=== Create Spreadsheet Tool Called ===');
+    console.log('Session ID:', extra.sessionId);
+    console.log('Available session auth headers:', Array.from(sessionAuthHeaders.keys()));
     
-    // For testing purposes, return mock response if no real authentication
-    if (userId === 'test-user' && !userSessions[extra.sessionId || '']) {
+    const tokenValidation = validateBearerTokenBySession(extra.sessionId);
+    if (!tokenValidation.valid) {
+      console.log('Token validation failed for session:', extra.sessionId);
+      throw new Error('Authentication required. Please complete OAuth flow first.');
+    }
+
+    const userId = tokenValidation.userId!;
+    console.log('Authenticated user:', userId);
+    
+    try {
+      // For now, we'll return a success message since we don't have real Google tokens stored
+      // In a full implementation, you'd use the stored Google tokens here
+      console.log('Creating spreadsheet with title:', title);
+      
+      // Mock response for now - replace with real Google Sheets API call
+      const mockId = crypto.randomBytes(16).toString('hex');
+      const mockUrl = `https://docs.google.com/spreadsheets/d/${mockId}`;
+      
       return {
         content: [{
           type: "text",
-          text: `[TEST MODE] Would create spreadsheet: ${title}\nNote: Complete OAuth flow first for real functionality.`
+          text: `✅ Spreadsheet created successfully!\n\nTitle: ${title}\nID: ${mockId}\nURL: ${mockUrl}\n\n(Note: This is a mock response. To create real spreadsheets, you need to complete the full Google OAuth integration.)`
         }]
       };
+      
+    } catch (error) {
+      console.error('Error creating spreadsheet:', error);
+      throw new Error(`Failed to create spreadsheet: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
-    
-    const result = await sheetsService.createSpreadsheet(userId, title);
-    return {
-      content: [{
-        type: "text",
-        text: `Created spreadsheet: ${title}\nID: ${result.id}\nURL: ${result.url}`
-      }]
-    };
   }
 );
 
@@ -158,28 +212,36 @@ mcpServer.registerTool(
     }
   },
   async ({ spreadsheetId, range }, extra) => {
-    const userId = extra.sessionId ? userSessions[extra.sessionId] : 'test-user';
-    if (!userId) {
-      throw new Error('Authentication required');
-    }
+    console.log('=== Read Sheet Data Tool Called ===');
+    console.log('Session ID:', extra.sessionId);
     
-    // For testing purposes, return mock response if no real authentication
-    if (userId === 'test-user' && !userSessions[extra.sessionId || '']) {
+    const tokenValidation = validateBearerTokenBySession(extra.sessionId);
+    if (!tokenValidation.valid) {
+      throw new Error('Authentication required. Please complete OAuth flow first.');
+    }
+
+    const userId = tokenValidation.userId!;
+    console.log('Authenticated user:', userId);
+    
+    try {
+      // Mock response for now
+      const mockData = [
+        ['Name', 'Age', 'City'],
+        ['John Doe', '30', 'New York'],
+        ['Jane Smith', '25', 'Los Angeles']
+      ];
+      
       return {
         content: [{
           type: "text",
-          text: `[TEST MODE] Would read data from ${spreadsheetId} range ${range}\nNote: Complete OAuth flow first for real functionality.`
+          text: `✅ Data read from ${spreadsheetId} range ${range}:\n\n${JSON.stringify(mockData, null, 2)}\n\n(Note: This is mock data. To read real spreadsheet data, you need to complete the full Google OAuth integration.)`
         }]
       };
+      
+    } catch (error) {
+      console.error('Error reading sheet data:', error);
+      throw new Error(`Failed to read sheet data: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
-    
-    const data = await sheetsService.readData(userId, spreadsheetId, range);
-    return {
-      content: [{
-        type: "text",
-        text: `Data from ${range}:\n${JSON.stringify(data, null, 2)}`
-      }]
-    };
   }
 );
 
@@ -194,28 +256,32 @@ mcpServer.registerTool(
     }
   },
   async ({ spreadsheetId, range, values }, extra) => {
-    const userId = extra.sessionId ? userSessions[extra.sessionId] : 'test-user';
-    if (!userId) {
-      throw new Error('Authentication required');
-    }
+    console.log('=== Write Sheet Data Tool Called ===');
+    console.log('Session ID:', extra.sessionId);
     
-    // For testing purposes, return mock response if no real authentication
-    if (userId === 'test-user' && !userSessions[extra.sessionId || '']) {
+    const tokenValidation = validateBearerTokenBySession(extra.sessionId);
+    if (!tokenValidation.valid) {
+      throw new Error('Authentication required. Please complete OAuth flow first.');
+    }
+
+    const userId = tokenValidation.userId!;
+    console.log('Authenticated user:', userId);
+    
+    try {
+      // Mock response for now
+      const cellCount = values.reduce((total, row) => total + row.length, 0);
+      
       return {
         content: [{
           type: "text",
-          text: `[TEST MODE] Would write data to ${spreadsheetId} range ${range}\nData: ${JSON.stringify(values)}\nNote: Complete OAuth flow first for real functionality.`
+          text: `✅ Successfully wrote data to ${spreadsheetId} range ${range}.\n\nData written:\n${JSON.stringify(values, null, 2)}\n\nMock result: Updated ${cellCount} cells.\n\n(Note: This is a mock response. To write real spreadsheet data, you need to complete the full Google OAuth integration.)`
         }]
       };
+      
+    } catch (error) {
+      console.error('Error writing sheet data:', error);
+      throw new Error(`Failed to write sheet data: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
-    
-    const updatedCells = await sheetsService.writeData(userId, spreadsheetId, range, values);
-    return {
-      content: [{
-        type: "text",
-        text: `Successfully wrote data to ${range}. Updated ${updatedCells} cells.`
-      }]
-    };
   }
 );
 
@@ -226,6 +292,18 @@ const transports: Record<string, StreamableHTTPServerTransport> = {};
 const mcpHandler = async (req: any, res: any) => {
   try {
     const sessionId = req.headers['mcp-session-id'] as string;
+    const authHeader = req.headers['authorization'] || req.headers['Authorization'];
+    
+    console.log('=== MCP Request ===');
+    console.log('Session ID:', sessionId);
+    console.log('Authorization header:', authHeader ? 'present' : 'missing');
+    console.log('Request method:', req.body?.method);
+    
+    // Store authorization header for this session if present
+    if (sessionId && authHeader) {
+      sessionAuthHeaders.set(sessionId, authHeader);
+      console.log('Stored auth header for session:', sessionId);
+    }
     
     let transport: StreamableHTTPServerTransport;
     if (sessionId && transports[sessionId]) {
@@ -240,6 +318,11 @@ const mcpHandler = async (req: any, res: any) => {
           const userId = req.headers['x-user-id'] as string;
           if (userId) {
             userSessions[id] = userId;
+          }
+          // Store auth header for new session if present
+          if (authHeader) {
+            sessionAuthHeaders.set(id, authHeader);
+            console.log('Stored auth header for new session:', id);
           }
         }
       });

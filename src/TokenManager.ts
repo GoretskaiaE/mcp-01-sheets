@@ -1,11 +1,11 @@
 import crypto from 'crypto';
 import { SecretManagerServiceClient } from '@google-cloud/secret-manager';
 
-interface TokenData {
+export interface TokenData {
   access_token: string;
   refresh_token?: string;
   expiry_date: number;
-  scope: string[];
+  scope: string[]; // Keep as array for internal storage
 }
 
 export class TokenManager {

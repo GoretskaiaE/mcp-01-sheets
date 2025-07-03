@@ -1,6 +1,6 @@
 import { google } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
-import { TokenManager } from './TokenManager';
+import { TokenManager, TokenData } from './TokenManager';
 
 export class GoogleSheetsService {
   private oauth2Client: OAuth2Client;
@@ -86,7 +86,15 @@ export class GoogleSheetsService {
       throw new Error('No tokens found for user');
     }
     
-    this.oauth2Client.setCredentials(tokens);
+    // Convert TokenData to Credentials format
+    const credentials = {
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
+      expiry_date: tokens.expiry_date,
+      scope: tokens.scope.join(' ') // Convert array to space-separated string
+    };
+    
+    this.oauth2Client.setCredentials(credentials);
     
     return google.sheets({ version: 'v4', auth: this.oauth2Client });
   }

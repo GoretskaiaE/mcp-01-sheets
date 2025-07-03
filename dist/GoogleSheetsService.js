@@ -66,7 +66,14 @@ class GoogleSheetsService {
         if (!tokens) {
             throw new Error('No tokens found for user');
         }
-        this.oauth2Client.setCredentials(tokens);
+        // Convert TokenData to Credentials format
+        const credentials = {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            expiry_date: tokens.expiry_date,
+            scope: tokens.scope.join(' ') // Convert array to space-separated string
+        };
+        this.oauth2Client.setCredentials(credentials);
         return googleapis_1.google.sheets({ version: 'v4', auth: this.oauth2Client });
     }
 }

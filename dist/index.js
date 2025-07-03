@@ -49,13 +49,12 @@ const mcpServer = new mcp_js_1.McpServer({
 });
 // Store user sessions
 const userSessions = {};
-// Register MCP tools with fixed context handling
+// Register MCP tools - FIXED: Removed 'name' property from options
 mcpServer.registerTool("create-spreadsheet", {
-    name: "create-spreadsheet",
     description: "Creates a new Google Spreadsheet with specified title",
-    inputSchema: zod_1.z.object({
+    inputSchema: {
         title: zod_1.z.string().min(1).max(100).describe("Title for the new spreadsheet")
-    })
+    }
 }, async ({ title }, extra) => {
     // Get userId from sessionId mapping
     const userId = extra.sessionId ? userSessions[extra.sessionId] : undefined;
@@ -71,12 +70,11 @@ mcpServer.registerTool("create-spreadsheet", {
     };
 });
 mcpServer.registerTool("read-sheet-data", {
-    name: "read-sheet-data",
     description: "Reads data from a specified range in a Google Sheet",
-    inputSchema: zod_1.z.object({
+    inputSchema: {
         spreadsheetId: zod_1.z.string().describe("Google Spreadsheet ID"),
         range: zod_1.z.string().describe("Range to read (e.g., 'Sheet1!A1:C10')")
-    })
+    }
 }, async ({ spreadsheetId, range }, extra) => {
     const userId = extra.sessionId ? userSessions[extra.sessionId] : undefined;
     if (!userId) {
@@ -90,10 +88,30 @@ mcpServer.registerTool("read-sheet-data", {
             }]
     };
 });
+mcpServer.registerTool("write-sheet-data", {
+    description: "Writes data to a specified range in a Google Sheet",
+    inputSchema: {
+        spreadsheetId: zod_1.z.string().describe("Google Spreadsheet ID"),
+        range: zod_1.z.string().describe("Range to write to (e.g., 'Sheet1!A1:C10')"),
+        values: zod_1.z.array(zod_1.z.array(zod_1.z.any())).describe("2D array of values to write")
+    }
+}, async ({ spreadsheetId, range, values }, extra) => {
+    const userId = extra.sessionId ? userSessions[extra.sessionId] : undefined;
+    if (!userId) {
+        throw new Error('Authentication required');
+    }
+    const updatedCells = await sheetsService.writeData(userId, spreadsheetId, range, values);
+    return {
+        content: [{
+                type: "text",
+                text: `Successfully wrote data to ${range}. Updated ${updatedCells} cells.`
+            }]
+    };
+});
 // Session management for MCP HTTP transport
 const transports = {};
-// MCP endpoint
-app.post('/mcp', async (req, res) => {
+// MCP endpoint - FIXED: Using proper Express handler pattern
+const mcpHandler = async (req, res) => {
     try {
         const sessionId = req.headers['mcp-session-id'];
         let transport;
@@ -124,9 +142,10 @@ app.post('/mcp', async (req, res) => {
         console.error('MCP request error:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
-});
-// OAuth endpoints
-app.get('/auth', async (req, res) => {
+};
+app.post('/mcp', mcpHandler);
+// OAuth endpoints - FIXED: Using proper Express handler pattern
+const authHandler = async (req, res) => {
     const state = crypto_1.default.randomBytes(32).toString('hex');
     const userId = req.query.user_id;
     if (!userId) {
@@ -136,8 +155,9 @@ app.get('/auth', async (req, res) => {
     req.session.userId = userId;
     const authUrl = sheetsService.getAuthUrl(state);
     res.redirect(authUrl);
-});
-app.get('/oauth2callback', async (req, res) => {
+};
+app.get('/auth', authHandler);
+const oauthCallbackHandler = async (req, res) => {
     const { code, state } = req.query;
     if (!state || !req.session.state || state !== req.session.state) {
         return res.status(400).json({ error: 'State mismatch' });
@@ -153,8 +173,9 @@ app.get('/oauth2callback', async (req, res) => {
         console.error('OAuth callback error:', error);
         res.status(500).json({ error: 'Authentication failed' });
     }
-});
-// OAuth metadata for Dynamic Client Registration
+};
+app.get('/oauth2callback', oauthCallbackHandler);
+// OAuth metadata for Dynamic Client Registration - FIXED: Using proper Express handler pattern
 app.get('/.well-known/oauth-authorization-server', (req, res) => {
     const baseUrl = `${req.protocol}://${req.get('host')}`;
     res.json({
@@ -168,7 +189,7 @@ app.get('/.well-known/oauth-authorization-server', (req, res) => {
         code_challenge_methods_supported: ['S256']
     });
 });
-// Health check for Cloud Run
+// Health check for Cloud Run - FIXED: Removed explicit type annotations
 app.get('/health', (req, res) => {
     res.json({
         status: 'healthy',

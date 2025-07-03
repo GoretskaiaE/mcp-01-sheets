@@ -53,15 +53,14 @@ const mcpServer = new McpServer({
 // Store user sessions
 const userSessions: Record<string, string> = {};
 
-// Register MCP tools with fixed context handling
+// Register MCP tools - FIXED: Removed 'name' property from options
 mcpServer.registerTool(
   "create-spreadsheet",
   {
-    name: "create-spreadsheet",
     description: "Creates a new Google Spreadsheet with specified title",
-    inputSchema: z.object({
+    inputSchema: {
       title: z.string().min(1).max(100).describe("Title for the new spreadsheet")
-    })
+    }
   },
   async ({ title }, extra) => {
     // Get userId from sessionId mapping
@@ -83,12 +82,11 @@ mcpServer.registerTool(
 mcpServer.registerTool(
   "read-sheet-data",
   {
-    name: "read-sheet-data",
     description: "Reads data from a specified range in a Google Sheet",
-    inputSchema: z.object({
+    inputSchema: {
       spreadsheetId: z.string().describe("Google Spreadsheet ID"),
       range: z.string().describe("Range to read (e.g., 'Sheet1!A1:C10')")
-    })
+    }
   },
   async ({ spreadsheetId, range }, extra) => {
     const userId = extra.sessionId ? userSessions[extra.sessionId] : undefined;
@@ -106,11 +104,37 @@ mcpServer.registerTool(
   }
 );
 
+mcpServer.registerTool(
+  "write-sheet-data",
+  {
+    description: "Writes data to a specified range in a Google Sheet",
+    inputSchema: {
+      spreadsheetId: z.string().describe("Google Spreadsheet ID"),
+      range: z.string().describe("Range to write to (e.g., 'Sheet1!A1:C10')"),
+      values: z.array(z.array(z.any())).describe("2D array of values to write")
+    }
+  },
+  async ({ spreadsheetId, range, values }, extra) => {
+    const userId = extra.sessionId ? userSessions[extra.sessionId] : undefined;
+    if (!userId) {
+      throw new Error('Authentication required');
+    }
+    
+    const updatedCells = await sheetsService.writeData(userId, spreadsheetId, range, values);
+    return {
+      content: [{
+        type: "text",
+        text: `Successfully wrote data to ${range}. Updated ${updatedCells} cells.`
+      }]
+    };
+  }
+);
+
 // Session management for MCP HTTP transport
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 
-// MCP endpoint
-app.post('/mcp', async (req, res) => {
+// MCP endpoint - FIXED: Using proper Express handler pattern
+const mcpHandler = async (req: any, res: any) => {
   try {
     const sessionId = req.headers['mcp-session-id'] as string;
     
@@ -140,10 +164,12 @@ app.post('/mcp', async (req, res) => {
     console.error('MCP request error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
-});
+};
 
-// OAuth endpoints
-app.get('/auth', async (req, res) => {
+app.post('/mcp', mcpHandler);
+
+// OAuth endpoints - FIXED: Using proper Express handler pattern
+const authHandler = async (req: any, res: any) => {
   const state = crypto.randomBytes(32).toString('hex');
   const userId = req.query.user_id as string;
   
@@ -156,9 +182,11 @@ app.get('/auth', async (req, res) => {
   
   const authUrl = sheetsService.getAuthUrl(state);
   res.redirect(authUrl);
-});
+};
 
-app.get('/oauth2callback', async (req, res) => {
+app.get('/auth', authHandler);
+
+const oauthCallbackHandler = async (req: any, res: any) => {
   const { code, state } = req.query;
   
   if (!state || !req.session.state || state !== req.session.state) {
@@ -176,10 +204,12 @@ app.get('/oauth2callback', async (req, res) => {
     console.error('OAuth callback error:', error);
     res.status(500).json({ error: 'Authentication failed' });
   }
-});
+};
 
-// OAuth metadata for Dynamic Client Registration
-app.get('/.well-known/oauth-authorization-server', (req, res) => {
+app.get('/oauth2callback', oauthCallbackHandler);
+
+// OAuth metadata for Dynamic Client Registration - FIXED: Using proper Express handler pattern
+app.get('/.well-known/oauth-authorization-server', (req: any, res: any) => {
   const baseUrl = `${req.protocol}://${req.get('host')}`;
   res.json({
     issuer: baseUrl,
@@ -193,7 +223,7 @@ app.get('/.well-known/oauth-authorization-server', (req, res) => {
   });
 });
 
-// Health check for Cloud Run
+// Health check for Cloud Run - FIXED: Removed explicit type annotations
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 

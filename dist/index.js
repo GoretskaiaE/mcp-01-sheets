@@ -133,6 +133,7 @@ async function getGoogleSheetsForClient(clientId) {
     return { tempUserId, sheetsService };
 }
 // Updated MCP tools with real Google Sheets API calls
+// Simplified MCP tools that don't need to check auth (it's handled at HTTP level)
 mcpServer.registerTool("create-spreadsheet", {
     description: "Creates a new Google Spreadsheet with specified title",
     inputSchema: {
@@ -141,11 +142,8 @@ mcpServer.registerTool("create-spreadsheet", {
 }, async ({ title }, extra) => {
     console.log('=== Create Spreadsheet Tool Called ===');
     console.log('Session ID:', extra.sessionId);
+    // Authentication is already validated at the HTTP level, so we can proceed
     const tokenValidation = validateBearerTokenBySession(extra.sessionId);
-    if (!tokenValidation.valid) {
-        console.log('Token validation failed for session:', extra.sessionId);
-        throw new Error('Authentication required. Please complete OAuth flow first.');
-    }
     const clientId = tokenValidation.clientId;
     console.log('Authenticated client:', clientId);
     try {
@@ -176,10 +174,8 @@ mcpServer.registerTool("read-sheet-data", {
 }, async ({ spreadsheetId, range }, extra) => {
     console.log('=== Read Sheet Data Tool Called ===');
     console.log('Session ID:', extra.sessionId);
+    // Authentication is already validated at the HTTP level
     const tokenValidation = validateBearerTokenBySession(extra.sessionId);
-    if (!tokenValidation.valid) {
-        throw new Error('Authentication required. Please complete OAuth flow first.');
-    }
     const clientId = tokenValidation.clientId;
     console.log('Authenticated client:', clientId);
     try {
@@ -219,10 +215,8 @@ mcpServer.registerTool("write-sheet-data", {
 }, async ({ spreadsheetId, range, values }, extra) => {
     console.log('=== Write Sheet Data Tool Called ===');
     console.log('Session ID:', extra.sessionId);
+    // Authentication is already validated at the HTTP level
     const tokenValidation = validateBearerTokenBySession(extra.sessionId);
-    if (!tokenValidation.valid) {
-        throw new Error('Authentication required. Please complete OAuth flow first.');
-    }
     const clientId = tokenValidation.clientId;
     console.log('Authenticated client:', clientId);
     try {
@@ -247,7 +241,7 @@ mcpServer.registerTool("write-sheet-data", {
 });
 // Session management for MCP HTTP transport
 const transports = {};
-// MCP endpoint - FIXED: Using proper Express handler pattern
+// Updated MCP handler that returns HTTP 401 when authentication is missing
 const mcpHandler = async (req, res) => {
     try {
         const sessionId = req.headers['mcp-session-id'];
@@ -256,6 +250,43 @@ const mcpHandler = async (req, res) => {
         console.log('Session ID:', sessionId);
         console.log('Authorization header:', authHeader ? 'present' : 'missing');
         console.log('Request method:', req.body?.method);
+        console.log('Request body:', JSON.stringify(req.body, null, 2));
+        // For tool calls, check authentication BEFORE processing
+        if (req.body?.method === 'tools/call') {
+            console.log('Tool call detected, checking authentication...');
+            // Check if we have valid authentication
+            let hasValidAuth = false;
+            if (sessionId && authHeader) {
+                // Store auth header for session
+                sessionAuthHeaders.set(sessionId, authHeader);
+                // Validate the token
+                const tokenValidation = validateBearerTokenBySession(sessionId);
+                hasValidAuth = tokenValidation.valid;
+                console.log('Token validation result:', hasValidAuth);
+            }
+            if (!hasValidAuth) {
+                console.log('Authentication required - returning 401');
+                // Return HTTP 401 with proper WWW-Authenticate header
+                // This tells Claude.ai that OAuth authentication is required
+                const baseUrl = `${req.protocol}://${req.get('host')}`;
+                res.status(401)
+                    .set({
+                    'WWW-Authenticate': `Bearer realm="${baseUrl}", resource="${baseUrl}/.well-known/oauth-protected-resource"`,
+                    'Content-Type': 'application/json'
+                })
+                    .json({
+                    error: {
+                        code: -32000,
+                        message: 'Authentication required',
+                        data: {
+                            type: 'auth_required',
+                            auth_url: `${baseUrl}/.well-known/oauth-authorization-server`
+                        }
+                    }
+                });
+                return;
+            }
+        }
         // Store authorization header for this session if present
         if (sessionId && authHeader) {
             sessionAuthHeaders.set(sessionId, authHeader);
@@ -447,24 +478,24 @@ app.get('/.well-known/oauth-authorization-server', (req, res) => {
     const baseUrl = `${req.protocol}://${req.get('host')}`;
     res.json({
         issuer: baseUrl,
-        authorization_endpoint: `${baseUrl}/oauth/authorize`, // Make sure this points to /oauth/authorize, NOT /auth
+        authorization_endpoint: `${baseUrl}/oauth/authorize`,
         token_endpoint: `${baseUrl}/oauth/token`,
         registration_endpoint: `${baseUrl}/oauth/register`,
         scopes_supported: ['read', 'write', 'sheets:access'],
         response_types_supported: ['code'],
         grant_types_supported: ['authorization_code', 'refresh_token'],
         token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
-        code_challenge_methods_supported: ['S256']
+        code_challenge_methods_supported: ['S256'],
+        service_documentation: `${baseUrl}/docs`
     });
 });
-// OAuth protected resource metadata (for MCP Inspector compatibility)
 app.get('/.well-known/oauth-protected-resource', (req, res) => {
     const baseUrl = `${req.protocol}://${req.get('host')}`;
     res.json({
-        resource: baseUrl,
-        authorization_servers: [`${baseUrl}`],
-        scopes_supported: ['read', 'write'],
-        bearer_methods_supported: ['header', 'body', 'query'],
+        resource: `${baseUrl}/mcp`,
+        authorization_servers: [baseUrl],
+        scopes_supported: ['read', 'write', 'sheets:access'],
+        bearer_methods_supported: ['header'],
         resource_documentation: `${baseUrl}/docs`
     });
 });

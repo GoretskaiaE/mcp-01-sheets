@@ -19,6 +19,8 @@ const tokenManager = new TokenManager_1.TokenManager();
 const sheetsService = new GoogleSheetsService_1.GoogleSheetsService(tokenManager);
 // Create Express app with security middleware
 const app = (0, express_1.default)();
+// IMPORTANT: Trust proxy for Cloud Run
+app.set('trust proxy', true);
 app.use(express_1.default.json({ limit: '10mb' }));
 app.use((0, helmet_1.default)({
     hsts: { maxAge: 31536000, includeSubDomains: true, preload: true }
@@ -33,13 +35,21 @@ app.use((0, express_session_1.default)({
     secret: process.env.SESSION_SECRET || 'dev-secret',
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: true, httpOnly: true, maxAge: 30 * 60 * 1000 }
+    cookie: {
+        secure: process.env.NODE_ENV === 'production', // Only secure in production
+        httpOnly: true,
+        maxAge: 30 * 60 * 1000,
+        sameSite: 'lax' // Important for OAuth flows
+    },
+    name: 'mcp-session', // Custom session name
+    proxy: true // Important for Cloud Run
 }));
-// Rate limiting
+// Rate limiting - Fixed for Cloud Run
 const rateLimiter = (0, express_rate_limit_1.default)({
     windowMs: 15 * 60 * 1000,
     max: 100,
-    standardHeaders: true
+    standardHeaders: true,
+    legacyHeaders: false
 });
 app.use(rateLimiter);
 // Initialize MCP Server
@@ -151,16 +161,41 @@ const authHandler = async (req, res) => {
     if (!userId) {
         return res.status(400).json({ error: 'user_id parameter required' });
     }
+    console.log('Setting session state:', state);
     req.session.state = state;
     req.session.userId = userId;
-    const authUrl = sheetsService.getAuthUrl(state);
-    res.redirect(authUrl);
+    // Force session save
+    req.session.save((err) => {
+        if (err) {
+            console.error('Session save error:', err);
+            return res.status(500).json({ error: 'Session save failed' });
+        }
+        console.log('Session saved successfully');
+        const authUrl = sheetsService.getAuthUrl(state);
+        res.redirect(authUrl);
+    });
 };
 app.get('/auth', authHandler);
 const oauthCallbackHandler = async (req, res) => {
     const { code, state } = req.query;
+    console.log('OAuth callback received:');
+    console.log('Query state:', state);
+    console.log('Session state:', req.session.state);
+    console.log('Session userId:', req.session.userId);
     if (!state || !req.session.state || state !== req.session.state) {
-        return res.status(400).json({ error: 'State mismatch' });
+        console.error('State mismatch:', {
+            queryState: state,
+            sessionState: req.session.state,
+            sessionExists: !!req.session
+        });
+        return res.status(400).json({
+            error: 'State mismatch',
+            debug: {
+                queryState: state,
+                sessionState: req.session.state,
+                sessionExists: !!req.session
+            }
+        });
     }
     if (!code || !req.session.userId) {
         return res.status(400).json({ error: 'Missing required parameters' });
@@ -195,6 +230,19 @@ app.get('/health', (req, res) => {
         status: 'healthy',
         timestamp: new Date().toISOString(),
         version: process.env.npm_package_version || '1.0.0'
+    });
+});
+// Debug endpoint to check environment variables
+app.get('/debug', (req, res) => {
+    res.json({
+        env: {
+            NODE_ENV: process.env.NODE_ENV || 'not set',
+            GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID ? 'set' : 'not set',
+            GOOGLE_REDIRECT_URI: process.env.GOOGLE_REDIRECT_URI || 'not set',
+            SESSION_SECRET: process.env.SESSION_SECRET ? 'set' : 'not set',
+            GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET ? 'set' : 'not set',
+            ENCRYPTION_KEY: process.env.ENCRYPTION_KEY ? 'set' : 'not set'
+        }
     });
 });
 // Start server - Fix the PORT type issue

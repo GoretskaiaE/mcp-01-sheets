@@ -31,6 +31,7 @@ app.use(cors({
     'https://claude.ai', 
     'https://cursor.sh',
     'http://localhost:6274',  // MCP Inspector
+    'https://inspector.modelcontextprotocol.io',  // Web-based MCP Inspector
     /^http:\/\/localhost:\d+$/  // Any localhost port for development
   ],
   credentials: true,
@@ -305,6 +306,18 @@ app.get('/.well-known/oauth-authorization-server', (req: any, res: any) => {
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code'],
     code_challenge_methods_supported: ['S256']
+  });
+});
+
+// OAuth protected resource metadata (for MCP Inspector compatibility)
+app.get('/.well-known/oauth-protected-resource', (req, res) => {
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  res.json({
+    resource: baseUrl,
+    authorization_servers: [`${baseUrl}`],
+    scopes_supported: ['read', 'write'],
+    bearer_methods_supported: ['header', 'body', 'query'],
+    resource_documentation: `${baseUrl}/docs`
   });
 });
 

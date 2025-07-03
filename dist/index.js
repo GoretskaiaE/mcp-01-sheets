@@ -30,11 +30,19 @@ app.use((0, cors_1.default)({
         'https://claude.ai',
         'https://cursor.sh',
         'http://localhost:6274', // MCP Inspector
+        'https://inspector.modelcontextprotocol.io', // Web-based MCP Inspector
         /^http:\/\/localhost:\d+$/ // Any localhost port for development
     ],
     credentials: true,
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-MCP-Version', 'mcp-session-id']
+    allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'X-MCP-Version',
+        'mcp-session-id',
+        'mcp-protocol-version', // Added for MCP Inspector
+        'x-user-id'
+    ]
 }));
 app.use((0, express_session_1.default)({
     secret: process.env.SESSION_SECRET || 'dev-secret',
@@ -265,6 +273,17 @@ app.get('/.well-known/oauth-authorization-server', (req, res) => {
         response_types_supported: ['code'],
         grant_types_supported: ['authorization_code'],
         code_challenge_methods_supported: ['S256']
+    });
+});
+// OAuth protected resource metadata (for MCP Inspector compatibility)
+app.get('/.well-known/oauth-protected-resource', (req, res) => {
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    res.json({
+        resource: baseUrl,
+        authorization_servers: [`${baseUrl}`],
+        scopes_supported: ['read', 'write'],
+        bearer_methods_supported: ['header', 'body', 'query'],
+        resource_documentation: `${baseUrl}/docs`
     });
 });
 // Health check for Cloud Run - FIXED: Removed explicit type annotations

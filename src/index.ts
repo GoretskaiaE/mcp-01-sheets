@@ -36,7 +36,14 @@ app.use(cors({
   ],
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-MCP-Version', 'mcp-session-id']
+  allowedHeaders: [
+    'Content-Type', 
+    'Authorization', 
+    'X-MCP-Version', 
+    'mcp-session-id',
+    'mcp-protocol-version',  // Added for MCP Inspector
+    'x-user-id'
+  ]
 }));
 
 app.use(session({

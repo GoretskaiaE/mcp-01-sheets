@@ -11,6 +11,41 @@ import crypto from 'crypto';
 import { TokenManager } from './TokenManager';
 import { GoogleSheetsService } from './GoogleSheetsService';
 
+interface ClientRegistration {
+  client_id: string;
+  client_secret: string;
+  client_id_issued_at: number;
+  client_secret_expires_at: number;
+  redirect_uris: string[];
+  grant_types: string[];
+  response_types: string[];
+  token_endpoint_auth_method: string;
+  client_name: string;
+  scope: string;
+}
+
+// Store user sessions
+const userSessions: Record<string, string> = {};
+
+const registeredClients = new Map<string, ClientRegistration>();
+// Storage for authorization codes (temporary, expire after 10 minutes)
+const authCodes = new Map<string, {
+  client_id: string;
+  code_challenge: string;
+  expires_at: number;
+  google_code: string;
+  created_at: number;
+}>();
+
+// Storage for access tokens (expire after 1 hour)
+const accessTokens = new Map<string, {
+  client_id: string;
+  scope: string;
+  expires_at: number;
+  refresh_token: string;
+  created_at: number;
+}>();
+
 // Initialize services
 const tokenManager = new TokenManager();
 const sheetsService = new GoogleSheetsService(tokenManager);
@@ -20,6 +55,8 @@ const app = express();
 
 // IMPORTANT: Trust proxy for Cloud Run
 app.set('trust proxy', true);
+
+app.use(express.urlencoded({ extended: true }));
 
 app.use(express.json({ limit: '10mb' }));
 app.use(helmet({
@@ -74,9 +111,6 @@ const mcpServer = new McpServer({
   name: "google-sheets-mcp",
   version: "1.0.0"
 });
-
-// Store user sessions
-const userSessions: Record<string, string> = {};
 
 // Register MCP tools - FIXED: Removed 'name' property from options
 mcpServer.registerTool(
@@ -254,44 +288,111 @@ app.get('/auth', authHandler);
 const oauthCallbackHandler = async (req: any, res: any) => {
   const { code, state } = req.query;
   
-  console.log('OAuth callback received:');
+  console.log('=== OAuth Callback ===');
   console.log('Query state:', state);
   console.log('Session state:', req.session.state);
-  console.log('Session userId:', req.session.userId);
+  console.log('Session oauthState:', JSON.stringify(req.session.oauthState, null, 2));
   console.log('Authorization code received:', code ? 'yes' : 'no');
   
-  if (!state || !req.session.state || state !== req.session.state) {
-    console.error('State mismatch:', { 
-      queryState: state, 
-      sessionState: req.session.state,
-      sessionExists: !!req.session
-    });
-    return res.status(400).json({ 
-      error: 'State mismatch',
-      debug: {
-        queryState: state,
-        sessionState: req.session.state,
-        sessionExists: !!req.session
-      }
-    });
-  }
-  
-  if (!code || !req.session.userId) {
-    console.error('Missing parameters:', { code: !!code, userId: !!req.session.userId });
-    return res.status(400).json({ error: 'Missing required parameters' });
-  }
-  
   try {
-    console.log('Attempting OAuth callback with userId:', req.session.userId);
-    await sheetsService.handleOAuthCallback(req.session.userId, code as string);
-    console.log('OAuth callback successful');
-    res.json({ success: true, message: 'Successfully connected to Google Sheets' });
+    // Check if this is an MCP OAuth flow (has oauthState) or original flow (has state)
+    if (req.session.oauthState) {
+      // This is the new MCP OAuth flow
+      console.log('Processing MCP OAuth callback');
+      
+      const oauthState = req.session.oauthState;
+      const clientId = oauthState.client_id;
+      const redirectUri = oauthState.redirect_uri;
+      const clientState = oauthState.state;
+      const codeChallenge = oauthState.code_challenge;
+      
+      if (!code) {
+        console.error('Missing authorization code from Google');
+        return res.status(400).json({ error: 'Missing authorization code' });
+      }
+      
+      // Generate authorization code for the MCP client
+      const authCode = crypto.randomBytes(32).toString('hex');
+      
+      // Store the auth code with all necessary information
+      authCodes.set(authCode, {
+        client_id: clientId,
+        code_challenge: codeChallenge,
+        expires_at: Date.now() + 600000, // 10 minutes
+        google_code: code,
+        created_at: Date.now()
+      });
+      
+      console.log('Stored auth code:', authCode);
+      console.log('Auth code details:', JSON.stringify(authCodes.get(authCode), null, 2));
+      
+      // Clean up session
+      delete req.session.oauthState;
+      
+      // Redirect back to the MCP client with the authorization code
+      const redirectUrl = new URL(redirectUri);
+      redirectUrl.searchParams.append('code', authCode);
+      if (clientState) {
+        redirectUrl.searchParams.append('state', clientState);
+      }
+      
+      console.log('Redirecting MCP client to:', redirectUrl.toString());
+      res.redirect(redirectUrl.toString());
+      
+    } else if (req.session.state) {
+      // This is the original manual OAuth flow
+      console.log('Processing original OAuth callback');
+      
+      if (!state || state !== req.session.state) {
+        console.error('State mismatch in original flow:', { 
+          queryState: state, 
+          sessionState: req.session.state
+        });
+        return res.status(400).json({ 
+          error: 'State mismatch',
+          debug: {
+            queryState: state,
+            sessionState: req.session.state,
+            sessionExists: !!req.session
+          }
+        });
+      }
+      
+      const userId = req.session.userId;
+      if (!userId) {
+        console.error('Missing userId in original flow');
+        return res.status(400).json({ error: 'Missing userId' });
+      }
+      
+      console.log('Attempting OAuth callback with userId:', userId);
+      await sheetsService.handleOAuthCallback(userId, code as string);
+      console.log('OAuth callback successful');
+      
+      // Clean up session
+      delete req.session.state;
+      delete req.session.userId;
+      
+      res.json({ success: true, message: 'Successfully connected to Google Sheets' });
+    } else {
+      console.error('No OAuth state found in session');
+      return res.status(400).json({ 
+        error: 'No OAuth state found',
+        debug: {
+          sessionExists: !!req.session,
+          hasState: !!req.session?.state,
+          hasOAuthState: !!req.session?.oauthState
+        }
+      });
+    }
+    
   } catch (error) {
-    console.error('OAuth callback error:', error);
+    console.error('=== OAuth Callback Error ===');
+    console.error('Error:', error);
     console.error('Error details:', {
       message: error instanceof Error ? error.message : 'Unknown error',
       stack: error instanceof Error ? error.stack : undefined
     });
+    
     res.status(500).json({ 
       error: 'Authentication failed',
       debug: error instanceof Error ? error.message : 'Unknown error'
@@ -302,16 +403,17 @@ const oauthCallbackHandler = async (req: any, res: any) => {
 app.get('/oauth2callback', oauthCallbackHandler);
 
 // OAuth metadata for Dynamic Client Registration - FIXED: Using proper Express handler pattern
-app.get('/.well-known/oauth-authorization-server', (req: any, res: any) => {
+app.get('/.well-known/oauth-authorization-server', (req, res) => {
   const baseUrl = `${req.protocol}://${req.get('host')}`;
   res.json({
     issuer: baseUrl,
-    authorization_endpoint: `${baseUrl}/auth`,
-    token_endpoint: `${baseUrl}/oauth2callback`,
+    authorization_endpoint: `${baseUrl}/oauth/authorize`, // Make sure this points to /oauth/authorize, NOT /auth
+    token_endpoint: `${baseUrl}/oauth/token`,
     registration_endpoint: `${baseUrl}/oauth/register`,
-    scopes_supported: ['read', 'write'],
+    scopes_supported: ['read', 'write', 'sheets:access'],
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
+    token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
     code_challenge_methods_supported: ['S256']
   });
 });
@@ -350,6 +452,355 @@ app.get('/debug', (req, res) => {
     }
   });
 });
+
+
+// OAuth registration endpoint handler - FIXED: Using proper Express handler pattern
+const oauthRegisterHandler = async (req: any, res: any) => {
+  try {
+    console.log('OAuth registration request received:', req.body);
+    
+    // Validate required fields
+    const { redirect_uris, grant_types = ['authorization_code'] } = req.body;
+    
+    if (!redirect_uris || !Array.isArray(redirect_uris) || redirect_uris.length === 0) {
+      return res.status(400).json({
+        error: 'invalid_redirect_uri',
+        error_description: 'redirect_uris is required and must be a non-empty array'
+      });
+    }
+
+    // Validate redirect URIs (HTTPS required, localhost allowed for dev)
+    for (const uri of redirect_uris) {
+      try {
+        const url = new URL(uri);
+        if (url.protocol !== 'https:' && !(url.protocol === 'http:' && url.hostname === 'localhost')) {
+          return res.status(400).json({
+            error: 'invalid_redirect_uri',
+            error_description: `Invalid redirect URI: ${uri}. Must use HTTPS or localhost.`
+          });
+        }
+      } catch (error) {
+        return res.status(400).json({
+          error: 'invalid_redirect_uri',
+          error_description: `Malformed redirect URI: ${uri}`
+        });
+      }
+    }
+
+    // Generate client credentials
+    const clientId = crypto.randomBytes(16).toString('hex');
+    const clientSecret = crypto.randomBytes(32).toString('hex');
+    const issuedAt = Math.floor(Date.now() / 1000);
+
+    // Build client metadata response
+    const clientMetadata: ClientRegistration = {
+      client_id: clientId,
+      client_secret: clientSecret,
+      client_id_issued_at: issuedAt,
+      client_secret_expires_at: 0, // Never expires
+      redirect_uris,
+      grant_types,
+      response_types: req.body.response_types || ['code'],
+      token_endpoint_auth_method: req.body.token_endpoint_auth_method || 'client_secret_basic',
+      client_name: req.body.client_name || 'MCP Client',
+      scope: req.body.scope || 'read write'
+    };
+
+    // Store client registration
+    registeredClients.set(clientId, clientMetadata);
+    
+    console.log('Client registered successfully:', clientId);
+
+    res.status(201).json(clientMetadata);
+
+  } catch (error) {
+    console.error('OAuth registration error:', error);
+    res.status(500).json({
+      error: 'server_error',
+      error_description: 'Internal server error during client registration'
+    });
+  }
+};
+
+// OAuth authorization endpoint handler - FIXED: Using proper Express handler pattern
+const oauthAuthorizeHandler = (req: any, res: any) => {
+  const { 
+    client_id, 
+    redirect_uri, 
+    state, 
+    code_challenge, 
+    code_challenge_method,
+    scope,
+    response_type 
+  } = req.query;
+
+  console.log('OAuth authorization request:', req.query);
+
+  // Validate required parameters
+  if (!client_id || !redirect_uri || !code_challenge) {
+    return res.status(400).json({
+      error: 'invalid_request',
+      error_description: 'Missing required parameters: client_id, redirect_uri, code_challenge'
+    });
+  }
+
+  // Validate client
+  const client = registeredClients.get(client_id as string);
+  if (!client) {
+    return res.status(400).json({
+      error: 'invalid_client',
+      error_description: 'Unknown client_id'
+    });
+  }
+
+  // Validate redirect URI
+  if (!client.redirect_uris.includes(redirect_uri as string)) {
+    return res.status(400).json({
+      error: 'invalid_request',
+      error_description: 'redirect_uri not registered for this client'
+    });
+  }
+
+  // Validate PKCE
+  if (code_challenge_method !== 'S256') {
+    return res.status(400).json({
+      error: 'invalid_request',
+      error_description: 'code_challenge_method must be S256'
+    });
+  }
+
+  // Store OAuth state for this client
+  const oauthState = crypto.randomBytes(32).toString('hex');
+  req.session.oauthState = {
+    client_id: client_id as string,
+    redirect_uri: redirect_uri as string,
+    state: state as string,
+    code_challenge: code_challenge as string,
+    scope: scope as string || 'read write'
+  };
+
+  // Redirect to Google OAuth with our state
+  const googleAuthUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+  googleAuthUrl.searchParams.append('client_id', process.env.GOOGLE_CLIENT_ID!);
+  googleAuthUrl.searchParams.append('redirect_uri', process.env.GOOGLE_REDIRECT_URI!);
+  googleAuthUrl.searchParams.append('response_type', 'code');
+  googleAuthUrl.searchParams.append('scope', 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file');
+  googleAuthUrl.searchParams.append('state', oauthState);
+  googleAuthUrl.searchParams.append('access_type', 'offline');
+  googleAuthUrl.searchParams.append('prompt', 'consent');
+
+  console.log('Redirecting to Google OAuth:', googleAuthUrl.toString());
+  res.redirect(googleAuthUrl.toString());
+};
+
+// OAuth token endpoint handler - FIXED: Using proper Express handler pattern
+const oauthTokenHandler = async (req: any, res: any) => {
+  console.log('=== OAuth Token Exchange Request ===');
+  console.log('Request Content-Type:', req.headers['content-type']);
+  console.log('Request body (raw):', req.body);
+  console.log('Request body keys:', req.body ? Object.keys(req.body) : 'undefined');
+  console.log('Request headers:', JSON.stringify(req.headers, null, 2));
+
+  try {
+    // Handle case where req.body might be undefined or empty
+    if (!req.body || typeof req.body !== 'object') {
+      console.error('Request body is missing or invalid:', req.body);
+      return res.status(400).json({
+        error: 'invalid_request',
+        error_description: 'Request body is missing or malformed. Expected form-encoded or JSON data.'
+      });
+    }
+
+    const { 
+      grant_type, 
+      code, 
+      redirect_uri, 
+      client_id, 
+      client_secret,
+      code_verifier 
+    } = req.body;
+
+    console.log('Extracted parameters:', {
+      grant_type,
+      code: code ? 'present' : 'missing',
+      redirect_uri,
+      client_id,
+      client_secret: client_secret ? 'present' : 'missing',
+      code_verifier: code_verifier ? 'present' : 'missing'
+    });
+
+    // Validate required parameters
+    if (!grant_type) {
+      console.error('Missing grant_type parameter');
+      return res.status(400).json({
+        error: 'invalid_request',
+        error_description: 'Missing grant_type parameter'
+      });
+    }
+
+    if (!code) {
+      console.error('Missing code parameter');
+      return res.status(400).json({
+        error: 'invalid_request',
+        error_description: 'Missing code parameter'
+      });
+    }
+
+    if (!client_id) {
+      console.error('Missing client_id parameter');
+      return res.status(400).json({
+        error: 'invalid_request',
+        error_description: 'Missing client_id parameter'
+      });
+    }
+
+    // Validate grant type
+    if (grant_type !== 'authorization_code') {
+      console.error('Unsupported grant type:', grant_type);
+      return res.status(400).json({
+        error: 'unsupported_grant_type',
+        error_description: 'Only authorization_code grant type is supported'
+      });
+    }
+
+    // Validate client
+    console.log('Looking up client_id:', client_id);
+    console.log('Registered clients:', Array.from(registeredClients.keys()));
+    
+    const client = registeredClients.get(client_id);
+    if (!client) {
+      console.error('Unknown client_id:', client_id);
+      return res.status(400).json({
+        error: 'invalid_client',
+        error_description: 'Unknown client_id'
+      });
+    }
+
+    console.log('Found client:', JSON.stringify(client, null, 2));
+
+    // Validate redirect URI if provided
+    if (redirect_uri && !client.redirect_uris.includes(redirect_uri)) {
+      console.error('Invalid redirect_uri:', redirect_uri);
+      console.error('Registered redirect_uris:', client.redirect_uris);
+      return res.status(400).json({
+        error: 'invalid_request',
+        error_description: 'redirect_uri not registered for this client'
+      });
+    }
+
+    // Check if we have a stored authorization code
+    console.log('Looking up authorization code:', code);
+    console.log('Stored auth codes:', Array.from(authCodes.keys()));
+    
+    const storedAuthCode = authCodes.get(code);
+    if (storedAuthCode) {
+      console.log('Found stored auth code:', JSON.stringify(storedAuthCode, null, 2));
+      
+      // Validate the authorization code hasn't expired
+      if (storedAuthCode.expires_at < Date.now()) {
+        console.error('Authorization code expired');
+        authCodes.delete(code); // Clean up expired code
+        return res.status(400).json({
+          error: 'invalid_grant',
+          error_description: 'Authorization code has expired'
+        });
+      }
+
+      // Validate client_id matches
+      if (storedAuthCode.client_id !== client_id) {
+        console.error('Client ID mismatch in auth code');
+        return res.status(400).json({
+          error: 'invalid_grant',
+          error_description: 'Authorization code was not issued to this client'
+        });
+      }
+
+      // Validate PKCE if code_verifier is provided
+      if (code_verifier && storedAuthCode.code_challenge) {
+        const crypto = require('crypto');
+        const hash = crypto.createHash('sha256').update(code_verifier).digest('base64url');
+        if (hash !== storedAuthCode.code_challenge) {
+          console.error('PKCE validation failed');
+          console.error('Expected hash:', storedAuthCode.code_challenge);
+          console.error('Computed hash:', hash);
+          return res.status(400).json({
+            error: 'invalid_grant',
+            error_description: 'PKCE validation failed'
+          });
+        }
+        console.log('PKCE validation successful');
+      }
+
+      // Remove the used authorization code
+      authCodes.delete(code);
+    } else {
+      console.log('No stored auth code found, treating as simple code exchange');
+    }
+
+    // Generate access token and refresh token
+    const accessToken = crypto.randomBytes(32).toString('hex');
+    const refreshToken = crypto.randomBytes(32).toString('hex');
+    const expiresIn = 3600; // 1 hour
+
+    // Store the access token
+    accessTokens.set(accessToken, {
+      client_id,
+      scope: client.scope,
+      expires_at: Date.now() + (expiresIn * 1000),
+      refresh_token: refreshToken,
+      created_at: Date.now()
+    });
+
+    console.log('Generated access token:', accessToken);
+    console.log('Stored access token info');
+
+    const tokenResponse = {
+      access_token: accessToken,
+      token_type: 'Bearer',
+      expires_in: expiresIn,
+      refresh_token: refreshToken,
+      scope: client.scope
+    };
+
+    console.log('Sending token response:', JSON.stringify(tokenResponse, null, 2));
+    res.json(tokenResponse);
+
+  } catch (error) {
+    console.error('=== OAuth Token Exchange Error ===');
+    console.error('Error:', error);
+    console.error('Error message:', error instanceof Error ? error.message : 'Unknown error');
+    console.error('Error stack:', error instanceof Error ? error.stack : 'No stack trace');
+    
+    res.status(500).json({
+      error: 'server_error',
+      error_description: 'Internal server error during token exchange',
+      debug: process.env.NODE_ENV === 'development' ? {
+        message: error instanceof Error ? error.message : 'Unknown error',
+        stack: error instanceof Error ? error.stack : undefined
+      } : undefined
+    });
+  }
+};
+
+// Register the OAuth endpoints - add these after your existing OAuth endpoints
+app.post('/oauth/register', oauthRegisterHandler);
+app.get('/oauth/authorize', oauthAuthorizeHandler);
+app.post('/oauth/token', oauthTokenHandler);
+
+// Add session type declaration (add this to extend the session type)
+declare module 'express-session' {
+  interface SessionData {
+    state?: string;
+    userId?: string;
+    oauthState?: {
+      client_id: string;
+      redirect_uri: string;
+      state: string;
+      code_challenge: string;
+      scope: string;
+    };
+  }
+}
 
 // Start server - Fix the PORT type issue
 const PORT = parseInt(process.env.PORT || '8080', 10);

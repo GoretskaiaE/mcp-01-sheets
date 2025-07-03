@@ -27,7 +27,12 @@ app.use(helmet({
 }));
 
 app.use(cors({
-  origin: ['https://claude.ai', 'https://cursor.sh'],
+  origin: [
+    'https://claude.ai', 
+    'https://cursor.sh',
+    'http://localhost:6274',  // MCP Inspector
+    /^http:\/\/localhost:\d+$/  // Any localhost port for development
+  ],
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-MCP-Version', 'mcp-session-id']
@@ -75,10 +80,20 @@ mcpServer.registerTool(
     }
   },
   async ({ title }, extra) => {
-    // Get userId from sessionId mapping
-    const userId = extra.sessionId ? userSessions[extra.sessionId] : undefined;
+    // Get userId from sessionId mapping or use test user
+    const userId = extra.sessionId ? userSessions[extra.sessionId] : 'test-user';
     if (!userId) {
       throw new Error('Authentication required');
+    }
+    
+    // For testing purposes, return mock response if no real authentication
+    if (userId === 'test-user' && !userSessions[extra.sessionId || '']) {
+      return {
+        content: [{
+          type: "text",
+          text: `[TEST MODE] Would create spreadsheet: ${title}\nNote: Complete OAuth flow first for real functionality.`
+        }]
+      };
     }
     
     const result = await sheetsService.createSpreadsheet(userId, title);
@@ -101,9 +116,19 @@ mcpServer.registerTool(
     }
   },
   async ({ spreadsheetId, range }, extra) => {
-    const userId = extra.sessionId ? userSessions[extra.sessionId] : undefined;
+    const userId = extra.sessionId ? userSessions[extra.sessionId] : 'test-user';
     if (!userId) {
       throw new Error('Authentication required');
+    }
+    
+    // For testing purposes, return mock response if no real authentication
+    if (userId === 'test-user' && !userSessions[extra.sessionId || '']) {
+      return {
+        content: [{
+          type: "text",
+          text: `[TEST MODE] Would read data from ${spreadsheetId} range ${range}\nNote: Complete OAuth flow first for real functionality.`
+        }]
+      };
     }
     
     const data = await sheetsService.readData(userId, spreadsheetId, range);
@@ -127,9 +152,19 @@ mcpServer.registerTool(
     }
   },
   async ({ spreadsheetId, range, values }, extra) => {
-    const userId = extra.sessionId ? userSessions[extra.sessionId] : undefined;
+    const userId = extra.sessionId ? userSessions[extra.sessionId] : 'test-user';
     if (!userId) {
       throw new Error('Authentication required');
+    }
+    
+    // For testing purposes, return mock response if no real authentication
+    if (userId === 'test-user' && !userSessions[extra.sessionId || '']) {
+      return {
+        content: [{
+          type: "text",
+          text: `[TEST MODE] Would write data to ${spreadsheetId} range ${range}\nData: ${JSON.stringify(values)}\nNote: Complete OAuth flow first for real functionality.`
+        }]
+      };
     }
     
     const updatedCells = await sheetsService.writeData(userId, spreadsheetId, range, values);
@@ -215,6 +250,7 @@ const oauthCallbackHandler = async (req: any, res: any) => {
   console.log('Query state:', state);
   console.log('Session state:', req.session.state);
   console.log('Session userId:', req.session.userId);
+  console.log('Authorization code received:', code ? 'yes' : 'no');
   
   if (!state || !req.session.state || state !== req.session.state) {
     console.error('State mismatch:', { 
@@ -233,15 +269,25 @@ const oauthCallbackHandler = async (req: any, res: any) => {
   }
   
   if (!code || !req.session.userId) {
+    console.error('Missing parameters:', { code: !!code, userId: !!req.session.userId });
     return res.status(400).json({ error: 'Missing required parameters' });
   }
   
   try {
+    console.log('Attempting OAuth callback with userId:', req.session.userId);
     await sheetsService.handleOAuthCallback(req.session.userId, code as string);
+    console.log('OAuth callback successful');
     res.json({ success: true, message: 'Successfully connected to Google Sheets' });
   } catch (error) {
     console.error('OAuth callback error:', error);
-    res.status(500).json({ error: 'Authentication failed' });
+    console.error('Error details:', {
+      message: error instanceof Error ? error.message : 'Unknown error',
+      stack: error instanceof Error ? error.stack : undefined
+    });
+    res.status(500).json({ 
+      error: 'Authentication failed',
+      debug: error instanceof Error ? error.message : 'Unknown error'
+    });
   }
 };
 

@@ -106,13 +106,29 @@ app.use(session({
   proxy: true // Important for Cloud Run
 }));
 
-// Rate limiting - Fixed for Cloud Run
 const rateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: 500, // Higher limit for OAuth flows
   standardHeaders: true,
-  legacyHeaders: false
+  legacyHeaders: false,
+  skip: (req) => {
+    const userAgent = req.headers['user-agent'] || '';
+    const path = req.path;
+    
+    const isClaudeAI = userAgent.toLowerCase().includes('claude') || 
+                      userAgent.includes('python-httpx');
+    const isOAuthPath = path.startsWith('/.well-known/') || 
+                       path.startsWith('/oauth/') || 
+                       path === '/mcp';
+    
+    if (isClaudeAI || isOAuthPath) {
+      return true; // Skip rate limiting
+    }
+    
+    return false;
+  }
 });
+
 app.use(rateLimiter);
 
 // Initialize MCP Server

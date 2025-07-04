@@ -38,10 +38,10 @@ app.use((0, helmet_1.default)({
 app.use((0, cors_1.default)({
     origin: [
         'https://claude.ai',
-        'https://cursor.sh',
-        'http://localhost:6274', // MCP Inspector
-        'https://inspector.modelcontextprotocol.io', // Web-based MCP Inspector
-        /^http:\/\/localhost:\d+$/ // Any localhost port for development
+        'https://*.claude.ai', // Allow subdomains
+        'http://localhost:6274',
+        'https://inspector.modelcontextprotocol.io',
+        /^http:\/\/localhost:\d+$/
     ],
     credentials: true,
     methods: ['GET', 'POST', 'OPTIONS'],
@@ -50,9 +50,10 @@ app.use((0, cors_1.default)({
         'Authorization',
         'X-MCP-Version',
         'mcp-session-id',
-        'mcp-protocol-version', // Added for MCP Inspector
+        'mcp-protocol-version',
         'x-user-id'
-    ]
+    ],
+    exposedHeaders: ['WWW-Authenticate'] // Add this
 }));
 app.use((0, express_session_1.default)({
     secret: process.env.SESSION_SECRET || 'dev-secret',
@@ -253,7 +254,6 @@ mcpServer.registerTool("write-sheet-data", {
 });
 // Session management for MCP HTTP transport
 const transports = {};
-// Replace your existing mcpHandler with this more restrictive version
 const mcpHandler = async (req, res) => {
     try {
         const sessionId = req.headers['mcp-session-id'];
@@ -266,6 +266,7 @@ const mcpHandler = async (req, res) => {
         console.log('User-Agent:', userAgent);
         console.log('Accept header:', acceptHeader);
         console.log('Request method:', req.body?.method);
+        console.log('Request body:', JSON.stringify(req.body, null, 2));
         // Special handling for Claude.ai user agent
         const isClaudeAI = userAgent.toLowerCase().includes('claude') ||
             req.headers['origin'] === 'https://claude.ai' ||
@@ -276,13 +277,39 @@ const mcpHandler = async (req, res) => {
             console.log('Claude.ai missing proper Accept header, setting it automatically');
             req.headers['accept'] = 'application/json, text/event-stream';
         }
-        // For Claude.ai: ONLY allow initialize and notifications/initialized without auth
-        // ALL other requests must have authentication
+        // For Claude.ai: Check if this is an auth probe request (tools/list without auth)
+        if (isClaudeAI && !authHeader && req.body?.method === 'tools/list') {
+            console.log('Claude.ai auth probe detected - returning 401 with OAuth info');
+            const baseUrl = `${req.protocol}://${req.get('host')}`;
+            return res.status(401)
+                .set({
+                'WWW-Authenticate': `Bearer realm="${baseUrl}", authorization_uri="${baseUrl}/oauth/authorize"`,
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': 'https://claude.ai',
+                'Access-Control-Allow-Headers': 'Authorization, Content-Type, mcp-session-id, Accept',
+                'Access-Control-Allow-Credentials': 'true'
+            })
+                .json({
+                jsonrpc: "2.0",
+                error: {
+                    code: -32000,
+                    message: 'Authentication required',
+                    data: {
+                        type: 'oauth_required',
+                        auth_url: `${baseUrl}/.well-known/oauth-authorization-server`,
+                        oauth_authorize_url: `${baseUrl}/oauth/authorize`,
+                        message: 'Please authenticate to use Google Sheets integration'
+                    }
+                },
+                id: req.body?.id || null
+            });
+        }
+        // For Claude.ai: Define which methods are allowed without auth
         if (isClaudeAI && req.body?.method) {
             const allowedWithoutAuth = ['initialize', 'notifications/initialized'];
             const requiresAuth = !allowedWithoutAuth.includes(req.body.method);
             if (requiresAuth) {
-                console.log(`Claude.ai ${req.body.method} request - REQUIRES authentication`);
+                console.log(`Claude.ai ${req.body.method} request - checking authentication`);
                 // Check for valid Bearer token
                 let hasValidAuth = false;
                 if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -309,12 +336,13 @@ const mcpHandler = async (req, res) => {
                     console.log(`Claude.ai ${req.body.method} without auth - returning 401`);
                     // Return HTTP 401 with proper WWW-Authenticate header
                     const baseUrl = `${req.protocol}://${req.get('host')}`;
-                    res.status(401)
+                    return res.status(401)
                         .set({
-                        'WWW-Authenticate': `Bearer realm="${baseUrl}", resource="${baseUrl}/.well-known/oauth-protected-resource"`,
+                        'WWW-Authenticate': `Bearer realm="${baseUrl}", authorization_uri="${baseUrl}/oauth/authorize"`,
                         'Content-Type': 'application/json',
-                        'Access-Control-Allow-Origin': req.headers['origin'] || '*',
-                        'Access-Control-Allow-Headers': 'Authorization, Content-Type, mcp-session-id, Accept'
+                        'Access-Control-Allow-Origin': 'https://claude.ai',
+                        'Access-Control-Allow-Headers': 'Authorization, Content-Type, mcp-session-id, Accept',
+                        'Access-Control-Allow-Credentials': 'true'
                     })
                         .json({
                         jsonrpc: "2.0",
@@ -324,12 +352,12 @@ const mcpHandler = async (req, res) => {
                             data: {
                                 type: 'auth_required',
                                 auth_url: `${baseUrl}/.well-known/oauth-authorization-server`,
-                                resource_url: `${baseUrl}/.well-known/oauth-protected-resource`
+                                resource_url: `${baseUrl}/.well-known/oauth-protected-resource`,
+                                oauth_authorize_url: `${baseUrl}/oauth/authorize`
                             }
                         },
                         id: req.body?.id || null
                     });
-                    return;
                 }
             }
             else {
@@ -341,6 +369,7 @@ const mcpHandler = async (req, res) => {
             sessionAuthHeaders.set(sessionId, authHeader);
             console.log('Stored auth header for session:', sessionId);
         }
+        // Handle MCP transport
         let transport;
         if (sessionId && transports[sessionId]) {
             transport = transports[sessionId];
@@ -348,7 +377,7 @@ const mcpHandler = async (req, res) => {
         }
         else if (req.body?.method === 'initialize') {
             console.log('Creating new transport for initialize request');
-            const newSessionId = crypto_1.default.randomUUID();
+            const newSessionId = sessionId || crypto_1.default.randomUUID();
             transport = new streamableHttp_js_1.StreamableHTTPServerTransport({
                 sessionIdGenerator: () => newSessionId,
                 onsessioninitialized: (id) => {
@@ -580,9 +609,11 @@ app.get('/.well-known/oauth-authorization-server', (req, res) => {
         scopes_supported: ['read', 'write', 'sheets:access'],
         response_types_supported: ['code'],
         grant_types_supported: ['authorization_code', 'refresh_token'],
-        token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
+        token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
         code_challenge_methods_supported: ['S256'],
-        service_documentation: `${baseUrl}/docs`
+        service_documentation: `${baseUrl}/docs`,
+        // Add this to indicate auth is required
+        require_auth_for_all_operations: true
     });
 });
 app.get('/.well-known/oauth-protected-resource', (req, res) => {
@@ -699,88 +730,131 @@ const oauthAuthorizeHandler = (req, res) => {
     console.log('Query parameters:', JSON.stringify(req.query, null, 2));
     console.log('All registered clients:', Array.from(registeredClients.keys()));
     // Validate required parameters
-    if (!client_id || !redirect_uri || !code_challenge) {
+    if (!client_id || !redirect_uri) {
         console.error('Missing required parameters');
         return res.status(400).json({
             error: 'invalid_request',
-            error_description: 'Missing required parameters: client_id, redirect_uri, code_challenge'
+            error_description: 'Missing required parameters: client_id and redirect_uri are required'
         });
     }
-    // Validate client - try to be more lenient for debugging
+    // Check if client is registered
     console.log('Looking up client_id:', client_id);
-    const client = registeredClients.get(client_id);
-    if (!client) {
-        console.error('Unknown client_id:', client_id);
-        console.error('Available clients:', Array.from(registeredClients.entries()));
-        // For Claude.ai, try to auto-register if it's from a known redirect URI
-        if (redirect_uri.includes('claude.ai')) {
-            console.log('Auto-registering Claude.ai client');
-            const autoClientMetadata = {
-                client_id: client_id,
-                client_secret: crypto_1.default.randomBytes(32).toString('hex'),
-                client_id_issued_at: Math.floor(Date.now() / 1000),
-                client_secret_expires_at: 0,
-                redirect_uris: [redirect_uri],
-                grant_types: ['authorization_code'],
-                response_types: ['code'],
-                token_endpoint_auth_method: 'client_secret_basic',
-                client_name: 'Claude.ai MCP Client (Auto-registered)',
-                scope: 'read write sheets:access'
-            };
-            registeredClients.set(client_id, autoClientMetadata);
-            console.log('Auto-registered client for Claude.ai:', client_id);
-        }
-        else {
-            return res.status(400).json({
-                error: 'invalid_client',
-                error_description: `Unknown client_id: ${client_id}. Please register first at /oauth/register`
-            });
-        }
+    let client = registeredClients.get(client_id);
+    // Auto-register Claude.ai clients if not found
+    if (!client && redirect_uri.includes('claude.ai')) {
+        console.log('Auto-registering Claude.ai client');
+        // Determine all valid Claude.ai redirect URIs
+        const claudeRedirectUris = [
+            'https://claude.ai/api/mcp/auth_callback',
+            'https://claude.ai/api/oauth/callback',
+            'https://claude.ai/oauth/callback',
+            redirect_uri
+        ].filter((uri, index, self) => self.indexOf(uri) === index); // Remove duplicates
+        const autoClientMetadata = {
+            client_id: client_id,
+            client_secret: crypto_1.default.randomBytes(32).toString('hex'),
+            client_id_issued_at: Math.floor(Date.now() / 1000),
+            client_secret_expires_at: 0, // Never expires
+            redirect_uris: claudeRedirectUris,
+            grant_types: ['authorization_code', 'refresh_token'],
+            response_types: ['code'],
+            token_endpoint_auth_method: 'none', // Claude.ai doesn't send client_secret
+            client_name: 'Claude.ai MCP Client (Auto-registered)',
+            scope: scope || 'read write sheets:access'
+        };
+        registeredClients.set(client_id, autoClientMetadata);
+        console.log('Auto-registered client for Claude.ai:', client_id);
+        console.log('Registered redirect URIs:', autoClientMetadata.redirect_uris);
+        // Set the client to the newly registered one
+        client = autoClientMetadata;
     }
-    // Get the client again (might be auto-registered now)
-    const validClient = registeredClients.get(client_id);
-    if (!validClient) {
+    // If still no client found, return error
+    if (!client) {
+        console.error('Unknown client_id and not Claude.ai:', client_id);
         return res.status(400).json({
             error: 'invalid_client',
-            error_description: 'Client registration failed'
+            error_description: `Unknown client_id: ${client_id}. Please register first at /oauth/register`
         });
     }
     // Validate redirect URI
-    if (!validClient.redirect_uris.includes(redirect_uri)) {
+    if (!client.redirect_uris.includes(redirect_uri)) {
         console.error('Invalid redirect_uri:', redirect_uri);
-        console.error('Registered redirect_uris:', validClient.redirect_uris);
+        console.error('Registered redirect_uris:', client.redirect_uris);
+        // For Claude.ai, be more lenient and add the redirect URI if it's from claude.ai domain
+        if (redirect_uri.includes('claude.ai')) {
+            console.log('Adding new Claude.ai redirect URI to client');
+            client.redirect_uris.push(redirect_uri);
+            // Update the stored client
+            registeredClients.set(client_id, client);
+        }
+        else {
+            return res.status(400).json({
+                error: 'invalid_request',
+                error_description: `redirect_uri not registered for this client. Registered: ${client.redirect_uris.join(', ')}`
+            });
+        }
+    }
+    // Validate response_type if provided
+    if (response_type && response_type !== 'code') {
         return res.status(400).json({
-            error: 'invalid_request',
-            error_description: `redirect_uri not registered for this client. Registered: ${validClient.redirect_uris.join(', ')}`
+            error: 'unsupported_response_type',
+            error_description: 'Only "code" response type is supported'
         });
     }
-    // Validate PKCE
-    if (code_challenge_method !== 'S256') {
-        return res.status(400).json({
-            error: 'invalid_request',
-            error_description: 'code_challenge_method must be S256'
-        });
+    // Validate PKCE if provided
+    if (code_challenge) {
+        if (!code_challenge_method || code_challenge_method !== 'S256') {
+            console.log('Warning: code_challenge_method not S256, got:', code_challenge_method);
+            // For Claude.ai compatibility, default to S256 if not specified
+            if (!code_challenge_method) {
+                console.log('Defaulting to S256 for PKCE');
+            }
+            else if (code_challenge_method !== 'S256') {
+                return res.status(400).json({
+                    error: 'invalid_request',
+                    error_description: 'code_challenge_method must be S256'
+                });
+            }
+        }
     }
+    // Generate a unique state for our OAuth flow
+    const oauthStateId = crypto_1.default.randomBytes(32).toString('hex');
     // Store OAuth state for this client
-    const oauthState = crypto_1.default.randomBytes(32).toString('hex');
     req.session.oauthState = {
         client_id: client_id,
         redirect_uri: redirect_uri,
-        state: state,
-        code_challenge: code_challenge,
-        scope: scope || 'read write sheets:access'
+        state: state || '',
+        code_challenge: code_challenge || '',
+        scope: scope || client.scope || 'read write sheets:access'
     };
-    // Redirect to Google OAuth with our state
-    const googleAuthUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
-    googleAuthUrl.searchParams.append('client_id', process.env.GOOGLE_CLIENT_ID);
-    googleAuthUrl.searchParams.append('redirect_uri', process.env.GOOGLE_REDIRECT_URI);
-    googleAuthUrl.searchParams.append('response_type', 'code');
-    googleAuthUrl.searchParams.append('scope', 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file');
-    googleAuthUrl.searchParams.append('state', oauthState);
-    googleAuthUrl.searchParams.append('access_type', 'offline');
-    googleAuthUrl.searchParams.append('prompt', 'consent');
-    console.log('Redirecting to Google OAuth:', googleAuthUrl.toString());
-    res.redirect(googleAuthUrl.toString());
+    console.log('Storing OAuth state in session:', {
+        client_id: client_id,
+        redirect_uri: redirect_uri,
+        has_state: !!state,
+        has_code_challenge: !!code_challenge
+    });
+    // Save session before redirect
+    req.session.save((err) => {
+        if (err) {
+            console.error('Session save error:', err);
+            return res.status(500).json({
+                error: 'server_error',
+                error_description: 'Failed to save session state'
+            });
+        }
+        console.log('Session saved successfully');
+        // Redirect to Google OAuth with our state
+        const googleAuthUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+        googleAuthUrl.searchParams.append('client_id', process.env.GOOGLE_CLIENT_ID);
+        googleAuthUrl.searchParams.append('redirect_uri', process.env.GOOGLE_REDIRECT_URI);
+        googleAuthUrl.searchParams.append('response_type', 'code');
+        googleAuthUrl.searchParams.append('scope', 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file');
+        googleAuthUrl.searchParams.append('state', oauthStateId);
+        googleAuthUrl.searchParams.append('access_type', 'offline');
+        googleAuthUrl.searchParams.append('prompt', 'consent');
+        console.log('Redirecting to Google OAuth');
+        res.redirect(googleAuthUrl.toString());
+    });
 };
 // OAuth token endpoint handler - FIXED: Using proper Express handler pattern
 const oauthTokenHandler = async (req, res) => {

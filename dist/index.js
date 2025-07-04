@@ -241,17 +241,24 @@ mcpServer.registerTool("write-sheet-data", {
 });
 // Session management for MCP HTTP transport
 const transports = {};
-// Updated MCP handler that returns HTTP 401 when authentication is missing
+// Enhanced MCP handler that ensures proper 401 responses for Claude.ai
 const mcpHandler = async (req, res) => {
     try {
         const sessionId = req.headers['mcp-session-id'];
         const authHeader = req.headers['authorization'] || req.headers['Authorization'];
+        const userAgent = req.headers['user-agent'] || '';
         console.log('=== MCP Request ===');
         console.log('Session ID:', sessionId);
         console.log('Authorization header:', authHeader ? 'present' : 'missing');
+        console.log('User-Agent:', userAgent);
         console.log('Request method:', req.body?.method);
-        console.log('Request body:', JSON.stringify(req.body, null, 2));
-        // For tool calls, check authentication BEFORE processing
+        console.log('Request params:', req.body?.params);
+        // Special handling for Claude.ai user agent
+        const isClaudeAI = userAgent.toLowerCase().includes('claude') ||
+            req.headers['origin'] === 'https://claude.ai' ||
+            req.headers['referer']?.includes('claude.ai');
+        console.log('Is Claude.ai request:', isClaudeAI);
+        // For tool calls, always require authentication
         if (req.body?.method === 'tools/call') {
             console.log('Tool call detected, checking authentication...');
             // Check if we have valid authentication
@@ -267,12 +274,46 @@ const mcpHandler = async (req, res) => {
             if (!hasValidAuth) {
                 console.log('Authentication required - returning 401');
                 // Return HTTP 401 with proper WWW-Authenticate header
-                // This tells Claude.ai that OAuth authentication is required
                 const baseUrl = `${req.protocol}://${req.get('host')}`;
                 res.status(401)
                     .set({
                     'WWW-Authenticate': `Bearer realm="${baseUrl}", resource="${baseUrl}/.well-known/oauth-protected-resource"`,
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': req.headers['origin'] || '*',
+                    'Access-Control-Allow-Headers': 'Authorization, Content-Type, mcp-session-id'
+                })
+                    .json({
+                    error: {
+                        code: -32000,
+                        message: 'Authentication required',
+                        data: {
+                            type: 'auth_required',
+                            auth_url: `${baseUrl}/.well-known/oauth-authorization-server`,
+                            resource_url: `${baseUrl}/.well-known/oauth-protected-resource`
+                        }
+                    }
+                });
+                return;
+            }
+        }
+        // For non-tool calls (like tools/list), always require auth for Claude.ai
+        if (isClaudeAI && req.body?.method === 'tools/list') {
+            console.log('Claude.ai tools/list request - checking authentication...');
+            let hasValidAuth = false;
+            if (sessionId && authHeader) {
+                sessionAuthHeaders.set(sessionId, authHeader);
+                const tokenValidation = validateBearerTokenBySession(sessionId);
+                hasValidAuth = tokenValidation.valid;
+            }
+            if (!hasValidAuth) {
+                console.log('Claude.ai tools/list without auth - returning 401');
+                const baseUrl = `${req.protocol}://${req.get('host')}`;
+                res.status(401)
+                    .set({
+                    'WWW-Authenticate': `Bearer realm="${baseUrl}", resource="${baseUrl}/.well-known/oauth-protected-resource"`,
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': req.headers['origin'] || '*',
+                    'Access-Control-Allow-Headers': 'Authorization, Content-Type, mcp-session-id'
                 })
                     .json({
                     error: {
@@ -520,37 +561,52 @@ app.get('/debug', (req, res) => {
         }
     });
 });
-// OAuth registration endpoint handler - FIXED: Using proper Express handler pattern
+// Enhanced OAuth registration endpoint with Claude.ai specific handling
 const oauthRegisterHandler = async (req, res) => {
     try {
-        console.log('OAuth registration request received:', req.body);
+        console.log('=== OAuth Registration Request ===');
+        console.log('Request headers:', JSON.stringify(req.headers, null, 2));
+        console.log('Request body:', JSON.stringify(req.body, null, 2));
+        console.log('User-Agent:', req.headers['user-agent']);
         // Validate required fields
         const { redirect_uris, grant_types = ['authorization_code'] } = req.body;
+        // Claude.ai specific redirect URIs
+        const claudeRedirectUris = [
+            'https://claude.ai/api/mcp/auth_callback',
+            'https://claude.ai/api/oauth/callback',
+            'https://claude.ai/oauth/callback'
+        ];
+        // Allow Claude.ai's redirect URIs or provided ones
+        let validRedirectUris = redirect_uris;
         if (!redirect_uris || !Array.isArray(redirect_uris) || redirect_uris.length === 0) {
-            return res.status(400).json({
-                error: 'invalid_redirect_uri',
-                error_description: 'redirect_uris is required and must be a non-empty array'
-            });
+            console.log('No redirect_uris provided, using Claude.ai defaults');
+            validRedirectUris = claudeRedirectUris;
         }
-        // Validate redirect URIs (HTTPS required, localhost allowed for dev)
-        for (const uri of redirect_uris) {
+        // Validate redirect URIs
+        for (const uri of validRedirectUris) {
             try {
                 const url = new URL(uri);
-                if (url.protocol !== 'https:' && !(url.protocol === 'http:' && url.hostname === 'localhost')) {
+                // Allow Claude.ai and localhost URIs
+                const isValid = (url.hostname === 'claude.ai' ||
+                    url.hostname === 'localhost' ||
+                    url.protocol === 'https:');
+                if (!isValid) {
+                    console.error('Invalid redirect URI:', uri);
                     return res.status(400).json({
                         error: 'invalid_redirect_uri',
-                        error_description: `Invalid redirect URI: ${uri}. Must use HTTPS or localhost.`
+                        error_description: `Invalid redirect URI: ${uri}. Must be HTTPS or Claude.ai domain.`
                     });
                 }
             }
             catch (error) {
+                console.error('Malformed redirect URI:', uri);
                 return res.status(400).json({
                     error: 'invalid_redirect_uri',
                     error_description: `Malformed redirect URI: ${uri}`
                 });
             }
         }
-        // Generate client credentials
+        // Generate client credentials with longer expiry for Claude.ai
         const clientId = crypto_1.default.randomBytes(16).toString('hex');
         const clientSecret = crypto_1.default.randomBytes(32).toString('hex');
         const issuedAt = Math.floor(Date.now() / 1000);
@@ -560,16 +616,17 @@ const oauthRegisterHandler = async (req, res) => {
             client_secret: clientSecret,
             client_id_issued_at: issuedAt,
             client_secret_expires_at: 0, // Never expires
-            redirect_uris,
+            redirect_uris: validRedirectUris,
             grant_types,
             response_types: req.body.response_types || ['code'],
             token_endpoint_auth_method: req.body.token_endpoint_auth_method || 'client_secret_basic',
-            client_name: req.body.client_name || 'MCP Client',
-            scope: req.body.scope || 'read write'
+            client_name: req.body.client_name || 'Claude.ai MCP Client',
+            scope: req.body.scope || 'read write sheets:access'
         };
         // Store client registration
         registeredClients.set(clientId, clientMetadata);
         console.log('Client registered successfully:', clientId);
+        console.log('Registered clients now:', Array.from(registeredClients.keys()));
         res.status(201).json(clientMetadata);
     }
     catch (error) {
@@ -580,30 +637,66 @@ const oauthRegisterHandler = async (req, res) => {
         });
     }
 };
-// OAuth authorization endpoint handler - FIXED: Using proper Express handler pattern
+// Enhanced OAuth authorization endpoint with better client lookup
 const oauthAuthorizeHandler = (req, res) => {
     const { client_id, redirect_uri, state, code_challenge, code_challenge_method, scope, response_type } = req.query;
-    console.log('OAuth authorization request:', req.query);
+    console.log('=== OAuth Authorization Request ===');
+    console.log('Query parameters:', JSON.stringify(req.query, null, 2));
+    console.log('All registered clients:', Array.from(registeredClients.keys()));
     // Validate required parameters
     if (!client_id || !redirect_uri || !code_challenge) {
+        console.error('Missing required parameters');
         return res.status(400).json({
             error: 'invalid_request',
             error_description: 'Missing required parameters: client_id, redirect_uri, code_challenge'
         });
     }
-    // Validate client
+    // Validate client - try to be more lenient for debugging
+    console.log('Looking up client_id:', client_id);
     const client = registeredClients.get(client_id);
     if (!client) {
+        console.error('Unknown client_id:', client_id);
+        console.error('Available clients:', Array.from(registeredClients.entries()));
+        // For Claude.ai, try to auto-register if it's from a known redirect URI
+        if (redirect_uri.includes('claude.ai')) {
+            console.log('Auto-registering Claude.ai client');
+            const autoClientMetadata = {
+                client_id: client_id,
+                client_secret: crypto_1.default.randomBytes(32).toString('hex'),
+                client_id_issued_at: Math.floor(Date.now() / 1000),
+                client_secret_expires_at: 0,
+                redirect_uris: [redirect_uri],
+                grant_types: ['authorization_code'],
+                response_types: ['code'],
+                token_endpoint_auth_method: 'client_secret_basic',
+                client_name: 'Claude.ai MCP Client (Auto-registered)',
+                scope: 'read write sheets:access'
+            };
+            registeredClients.set(client_id, autoClientMetadata);
+            console.log('Auto-registered client for Claude.ai:', client_id);
+        }
+        else {
+            return res.status(400).json({
+                error: 'invalid_client',
+                error_description: `Unknown client_id: ${client_id}. Please register first at /oauth/register`
+            });
+        }
+    }
+    // Get the client again (might be auto-registered now)
+    const validClient = registeredClients.get(client_id);
+    if (!validClient) {
         return res.status(400).json({
             error: 'invalid_client',
-            error_description: 'Unknown client_id'
+            error_description: 'Client registration failed'
         });
     }
     // Validate redirect URI
-    if (!client.redirect_uris.includes(redirect_uri)) {
+    if (!validClient.redirect_uris.includes(redirect_uri)) {
+        console.error('Invalid redirect_uri:', redirect_uri);
+        console.error('Registered redirect_uris:', validClient.redirect_uris);
         return res.status(400).json({
             error: 'invalid_request',
-            error_description: 'redirect_uri not registered for this client'
+            error_description: `redirect_uri not registered for this client. Registered: ${validClient.redirect_uris.join(', ')}`
         });
     }
     // Validate PKCE
@@ -620,7 +713,7 @@ const oauthAuthorizeHandler = (req, res) => {
         redirect_uri: redirect_uri,
         state: state,
         code_challenge: code_challenge,
-        scope: scope || 'read write'
+        scope: scope || 'read write sheets:access'
     };
     // Redirect to Google OAuth with our state
     const googleAuthUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
@@ -797,6 +890,27 @@ const oauthTokenHandler = async (req, res) => {
 app.post('/oauth/register', oauthRegisterHandler);
 app.get('/oauth/authorize', oauthAuthorizeHandler);
 app.post('/oauth/token', oauthTokenHandler);
+// Add a debug endpoint to see registered clients
+app.get('/debug/clients', (req, res) => {
+    const clients = Array.from(registeredClients.entries()).map(([id, client]) => ({
+        client_id: id,
+        client_name: client.client_name,
+        redirect_uris: client.redirect_uris,
+        created_at: client.client_id_issued_at
+    }));
+    res.json({
+        total_clients: clients.length,
+        clients: clients
+    });
+});
+// Add a debug endpoint to clear all clients (for testing)
+app.post('/debug/clear-clients', (req, res) => {
+    const count = registeredClients.size;
+    registeredClients.clear();
+    res.json({
+        message: `Cleared ${count} registered clients`
+    });
+});
 // Start server - Fix the PORT type issue
 const PORT = parseInt(process.env.PORT || '8080', 10);
 app.listen(PORT, '0.0.0.0', () => {

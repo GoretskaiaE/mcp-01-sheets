@@ -335,13 +335,14 @@ const mcpHandler = async (req: any, res: any) => {
     const sessionId = req.headers['mcp-session-id'] as string;
     const authHeader = req.headers['authorization'] || req.headers['Authorization'];
     const userAgent = req.headers['user-agent'] || '';
+    const acceptHeader = req.headers['accept'] || '';
     
     console.log('=== MCP Request ===');
     console.log('Session ID:', sessionId);
     console.log('Authorization header:', authHeader ? 'present' : 'missing');
     console.log('User-Agent:', userAgent);
+    console.log('Accept header:', acceptHeader);
     console.log('Request method:', req.body?.method);
-    console.log('Request params:', req.body?.params);
     
     // Special handling for Claude.ai user agent
     const isClaudeAI = userAgent.toLowerCase().includes('claude') || 
@@ -350,26 +351,45 @@ const mcpHandler = async (req: any, res: any) => {
     
     console.log('Is Claude.ai request:', isClaudeAI);
     
-    // For tool calls, always require authentication
-    if (req.body?.method === 'tools/call') {
-      console.log('Tool call detected, checking authentication...');
+    // CRITICAL FIX: Handle missing Accept header for Claude.ai
+    if (isClaudeAI && (!acceptHeader || !acceptHeader.includes('text/event-stream'))) {
+      console.log('Claude.ai missing proper Accept header, setting it automatically');
+      req.headers['accept'] = 'application/json, text/event-stream';
+    }
+    
+    // For Claude.ai: Require authentication for all requests except initialize and notifications
+    if (isClaudeAI && req.body?.method && 
+        req.body.method !== 'initialize' && 
+        req.body.method !== 'notifications/initialized') {
       
-      // Check if we have valid authentication
+      console.log(`Claude.ai ${req.body.method} request - checking authentication...`);
+      
+      // Check for valid Bearer token
       let hasValidAuth = false;
       
-      if (sessionId && authHeader) {
-        // Store auth header for session
-        sessionAuthHeaders.set(sessionId, authHeader);
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.substring(7);
+        console.log('Found Bearer token for validation');
         
-        // Validate the token
-        const tokenValidation = validateBearerTokenBySession(sessionId);
-        hasValidAuth = tokenValidation.valid;
-        
-        console.log('Token validation result:', hasValidAuth);
+        // Validate the token directly
+        const tokenData = accessTokens.get(token);
+        if (tokenData && tokenData.expires_at > Date.now()) {
+          hasValidAuth = true;
+          console.log('Token is valid for client:', tokenData.client_id);
+          
+          // Store for session if we have one
+          if (sessionId) {
+            sessionAuthHeaders.set(sessionId, authHeader);
+          }
+        } else {
+          console.log('Token validation failed:', tokenData ? 'expired' : 'not found');
+        }
+      } else {
+        console.log('No valid Bearer token found');
       }
       
       if (!hasValidAuth) {
-        console.log('Authentication required - returning 401');
+        console.log(`Claude.ai ${req.body.method} without auth - returning 401`);
         
         // Return HTTP 401 with proper WWW-Authenticate header
         const baseUrl = `${req.protocol}://${req.get('host')}`;
@@ -379,9 +399,10 @@ const mcpHandler = async (req: any, res: any) => {
              'WWW-Authenticate': `Bearer realm="${baseUrl}", resource="${baseUrl}/.well-known/oauth-protected-resource"`,
              'Content-Type': 'application/json',
              'Access-Control-Allow-Origin': req.headers['origin'] || '*',
-             'Access-Control-Allow-Headers': 'Authorization, Content-Type, mcp-session-id'
+             'Access-Control-Allow-Headers': 'Authorization, Content-Type, mcp-session-id, Accept'
            })
            .json({
+             jsonrpc: "2.0",
              error: {
                code: -32000,
                message: 'Authentication required',
@@ -390,43 +411,8 @@ const mcpHandler = async (req: any, res: any) => {
                  auth_url: `${baseUrl}/.well-known/oauth-authorization-server`,
                  resource_url: `${baseUrl}/.well-known/oauth-protected-resource`
                }
-             }
-           });
-        return;
-      }
-    }
-    
-    // For non-tool calls (like tools/list), always require auth for Claude.ai
-    if (isClaudeAI && req.body?.method === 'tools/list') {
-      console.log('Claude.ai tools/list request - checking authentication...');
-      
-      let hasValidAuth = false;
-      if (sessionId && authHeader) {
-        sessionAuthHeaders.set(sessionId, authHeader);
-        const tokenValidation = validateBearerTokenBySession(sessionId);
-        hasValidAuth = tokenValidation.valid;
-      }
-      
-      if (!hasValidAuth) {
-        console.log('Claude.ai tools/list without auth - returning 401');
-        const baseUrl = `${req.protocol}://${req.get('host')}`;
-        
-        res.status(401)
-           .set({
-             'WWW-Authenticate': `Bearer realm="${baseUrl}", resource="${baseUrl}/.well-known/oauth-protected-resource"`,
-             'Content-Type': 'application/json',
-             'Access-Control-Allow-Origin': req.headers['origin'] || '*',
-             'Access-Control-Allow-Headers': 'Authorization, Content-Type, mcp-session-id'
-           })
-           .json({
-             error: {
-               code: -32000,
-               message: 'Authentication required',
-               data: {
-                 type: 'auth_required',
-                 auth_url: `${baseUrl}/.well-known/oauth-authorization-server`
-               }
-             }
+             },
+             id: req.body?.id || null
            });
         return;
       }
@@ -441,12 +427,16 @@ const mcpHandler = async (req: any, res: any) => {
     let transport: StreamableHTTPServerTransport;
     if (sessionId && transports[sessionId]) {
       transport = transports[sessionId];
+      console.log('Using existing transport for session:', sessionId);
     } else if (req.body?.method === 'initialize') {
+      console.log('Creating new transport for initialize request');
       const newSessionId = crypto.randomUUID();
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => newSessionId,
         onsessioninitialized: (id) => {
           transports[id] = transport;
+          console.log('Initialized new MCP session:', id);
+          
           // Map session to user if provided
           const userId = req.headers['x-user-id'] as string;
           if (userId) {
@@ -461,15 +451,49 @@ const mcpHandler = async (req: any, res: any) => {
       });
       await mcpServer.connect(transport);
     } else {
-      return res.status(400).json({ error: 'Invalid request or missing session' });
+      console.log('Invalid MCP request - no session and not initialize');
+      console.log('Request details:', {
+        method: req.body?.method,
+        sessionId,
+        hasTransport: !!transports[sessionId]
+      });
+      return res.status(400).json({ 
+        jsonrpc: "2.0",
+        error: {
+          code: -32600,
+          message: 'Invalid request or missing session. Please initialize session first.'
+        },
+        id: req.body?.id || null
+      });
     }
     
+    console.log('Processing MCP request through transport');
     await transport.handleRequest(req, res, req.body);
   } catch (error) {
     console.error('MCP request error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ 
+      jsonrpc: "2.0",
+      error: {
+        code: -32603,
+        message: 'Internal server error',
+        data: error instanceof Error ? error.message : 'Unknown error'
+      },
+      id: req.body?.id || null
+    });
   }
 };
+
+// Also add CORS headers to handle Claude.ai's preflight requests
+app.options('/mcp', (req, res) => {
+  res.set({
+    'Access-Control-Allow-Origin': req.headers['origin'] || '*',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type, mcp-session-id, Accept, User-Agent',
+    'Access-Control-Max-Age': '86400'
+  }).status(200).end();
+});
+
+// Update your existing handler registration
 app.post('/mcp', mcpHandler);
 
 // OAuth endpoints - FIXED: Using proper Express handler pattern

@@ -253,7 +253,7 @@ mcpServer.registerTool("write-sheet-data", {
 });
 // Session management for MCP HTTP transport
 const transports = {};
-// Enhanced MCP handler that ensures proper 401 responses for Claude.ai
+// Replace your existing mcpHandler with this more restrictive version
 const mcpHandler = async (req, res) => {
     try {
         const sessionId = req.headers['mcp-session-id'];
@@ -276,58 +276,64 @@ const mcpHandler = async (req, res) => {
             console.log('Claude.ai missing proper Accept header, setting it automatically');
             req.headers['accept'] = 'application/json, text/event-stream';
         }
-        // For Claude.ai: Require authentication for all requests except initialize and notifications
-        if (isClaudeAI && req.body?.method &&
-            req.body.method !== 'initialize' &&
-            req.body.method !== 'notifications/initialized') {
-            console.log(`Claude.ai ${req.body.method} request - checking authentication...`);
-            // Check for valid Bearer token
-            let hasValidAuth = false;
-            if (authHeader && authHeader.startsWith('Bearer ')) {
-                const token = authHeader.substring(7);
-                console.log('Found Bearer token for validation');
-                // Validate the token directly
-                const tokenData = accessTokens.get(token);
-                if (tokenData && tokenData.expires_at > Date.now()) {
-                    hasValidAuth = true;
-                    console.log('Token is valid for client:', tokenData.client_id);
-                    // Store for session if we have one
-                    if (sessionId) {
-                        sessionAuthHeaders.set(sessionId, authHeader);
+        // For Claude.ai: ONLY allow initialize and notifications/initialized without auth
+        // ALL other requests must have authentication
+        if (isClaudeAI && req.body?.method) {
+            const allowedWithoutAuth = ['initialize', 'notifications/initialized'];
+            const requiresAuth = !allowedWithoutAuth.includes(req.body.method);
+            if (requiresAuth) {
+                console.log(`Claude.ai ${req.body.method} request - REQUIRES authentication`);
+                // Check for valid Bearer token
+                let hasValidAuth = false;
+                if (authHeader && authHeader.startsWith('Bearer ')) {
+                    const token = authHeader.substring(7);
+                    console.log('Found Bearer token for validation');
+                    // Validate the token directly
+                    const tokenData = accessTokens.get(token);
+                    if (tokenData && tokenData.expires_at > Date.now()) {
+                        hasValidAuth = true;
+                        console.log('Token is valid for client:', tokenData.client_id);
+                        // Store for session if we have one
+                        if (sessionId) {
+                            sessionAuthHeaders.set(sessionId, authHeader);
+                        }
+                    }
+                    else {
+                        console.log('Token validation failed:', tokenData ? 'expired' : 'not found');
                     }
                 }
                 else {
-                    console.log('Token validation failed:', tokenData ? 'expired' : 'not found');
+                    console.log('No valid Bearer token found');
+                }
+                if (!hasValidAuth) {
+                    console.log(`Claude.ai ${req.body.method} without auth - returning 401`);
+                    // Return HTTP 401 with proper WWW-Authenticate header
+                    const baseUrl = `${req.protocol}://${req.get('host')}`;
+                    res.status(401)
+                        .set({
+                        'WWW-Authenticate': `Bearer realm="${baseUrl}", resource="${baseUrl}/.well-known/oauth-protected-resource"`,
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': req.headers['origin'] || '*',
+                        'Access-Control-Allow-Headers': 'Authorization, Content-Type, mcp-session-id, Accept'
+                    })
+                        .json({
+                        jsonrpc: "2.0",
+                        error: {
+                            code: -32000,
+                            message: 'Authentication required',
+                            data: {
+                                type: 'auth_required',
+                                auth_url: `${baseUrl}/.well-known/oauth-authorization-server`,
+                                resource_url: `${baseUrl}/.well-known/oauth-protected-resource`
+                            }
+                        },
+                        id: req.body?.id || null
+                    });
+                    return;
                 }
             }
             else {
-                console.log('No valid Bearer token found');
-            }
-            if (!hasValidAuth) {
-                console.log(`Claude.ai ${req.body.method} without auth - returning 401`);
-                // Return HTTP 401 with proper WWW-Authenticate header
-                const baseUrl = `${req.protocol}://${req.get('host')}`;
-                res.status(401)
-                    .set({
-                    'WWW-Authenticate': `Bearer realm="${baseUrl}", resource="${baseUrl}/.well-known/oauth-protected-resource"`,
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': req.headers['origin'] || '*',
-                    'Access-Control-Allow-Headers': 'Authorization, Content-Type, mcp-session-id, Accept'
-                })
-                    .json({
-                    jsonrpc: "2.0",
-                    error: {
-                        code: -32000,
-                        message: 'Authentication required',
-                        data: {
-                            type: 'auth_required',
-                            auth_url: `${baseUrl}/.well-known/oauth-authorization-server`,
-                            resource_url: `${baseUrl}/.well-known/oauth-protected-resource`
-                        }
-                    },
-                    id: req.body?.id || null
-                });
-                return;
+                console.log(`Claude.ai ${req.body.method} request - allowed without auth`);
             }
         }
         // Store authorization header for this session if present
@@ -394,6 +400,18 @@ const mcpHandler = async (req, res) => {
         });
     }
 };
+// Also add an endpoint to test what methods Claude.ai is calling
+app.post('/debug/mcp-test', (req, res) => {
+    console.log('=== DEBUG MCP Test Request ===');
+    console.log('Headers:', JSON.stringify(req.headers, null, 2));
+    console.log('Body:', JSON.stringify(req.body, null, 2));
+    res.json({
+        received_method: req.body?.method,
+        user_agent: req.headers['user-agent'],
+        has_auth: !!(req.headers['authorization'] || req.headers['Authorization']),
+        timestamp: new Date().toISOString()
+    });
+});
 // Also add CORS headers to handle Claude.ai's preflight requests
 app.options('/mcp', (req, res) => {
     res.set({
